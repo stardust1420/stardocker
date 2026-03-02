@@ -1,4 +1,4 @@
-<![CDATA[<div align="center">
+<div align="center">
 
 ```
 ███████╗████████╗ █████╗ ██████╗ ██████╗  ██████╗  ██████╗██╗  ██╗███████╗██████╗
@@ -9,7 +9,7 @@
 ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
 ```
 
-**A sleek terminal UI to manage your Docker containers — no browser required.**
+**A sleek terminal UI to manage your Docker containers**
 
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
 [![Docker](https://img.shields.io/badge/Docker-Engine-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
@@ -144,4 +144,4 @@ This project is open-source and available under the [MIT License](LICENSE).
 Made with ☕ and Go
 
 </div>
-]]>
+
