@@ -5,55 +5,39 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"time"
 
 	"github.com/stardust1405/stardocker/src"
 
 	tea "github.com/charmbracelet/bubbletea"
-	vanillaDockerClient "github.com/docker/docker/client"
 	"github.com/docker/go-sdk/client"
 )
 
 func main() {
 	ctx := context.TODO()
 
-	// Try creating a Docker client
-	cli, err := vanillaDockerClient.NewClientWithOpts()
-	if err != nil {
-		panic(err)
-	}
-
-	// Check if Docker is alive
-	_, err = cli.Ping(ctx)
-	if err != nil {
-		fmt.Println("Docker daemon not running. Starting Docker Desktop...")
-
-		// Start Docker Desktop headless
-		exec.Command("open", "-a", "Docker", "--args", "--unattended").Start()
-
-		// Wait for daemon to come up
-		for {
-			_, err = cli.Ping(ctx)
-			if err == nil {
-				fmt.Println("Docker is ready!")
-				break
-			}
-			fmt.Println("Waiting for Docker daemon...")
-			time.Sleep(2 * time.Second)
-		}
-	} else {
-		fmt.Println("Docker already running.")
-	}
-
-	// Close the client when done
-	err = cli.Close()
-	if err != nil {
-		panic(err)
-	}
-
+	// client.New resolves the daemon from DOCKER_HOST or the current docker
+	// context (Colima registers and selects a "colima" context) and pings it.
 	dockerClient, err := client.New(ctx)
 	if err != nil {
-		panic(err)
+		fmt.Println("Docker daemon not reachable. Starting Colima...")
+
+		// colima start blocks until the VM and Docker daemon are ready.
+		cmd := exec.Command("colima", "start")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("Failed to start Colima: %v\n", err)
+			os.Exit(1)
+		}
+
+		dockerClient, err = client.New(ctx)
+		if err != nil {
+			fmt.Printf("Docker daemon still not reachable after starting Colima: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Docker is ready!")
+	} else {
+		fmt.Println("Docker already running.")
 	}
 
 	// Close the docker client when done

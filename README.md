@@ -26,7 +26,7 @@
 - 📜 **Live Logs** — stream container logs in real-time with a scrollable viewport
 - 🗂️ **Compose-aware** — automatically groups Docker Compose stacks with expandable children
 - 🖼️ **Browse Images** — view available Docker images and their download status
-- 🚀 **Auto-starts Docker** — detects if the Docker daemon is down and launches Docker Desktop for you (macOS)
+- 🚀 **Auto-starts Docker** — detects if the Docker daemon is down and runs `colima start` for you
 - ⌨️ **Keyboard-driven** — fast, intuitive navigation with vim-style keybindings
 
 ---
@@ -42,7 +42,7 @@ StarDocker connects directly to your local Docker daemon via the Docker SDK. It 
 ### Prerequisites
 
 - [Go 1.24+](https://go.dev/dl/)
-- [Docker](https://docs.docker.com/get-docker/) installed and the daemon running (or Docker Desktop on macOS — StarDocker will start it for you)
+- A Docker daemon reachable via `DOCKER_HOST` or the current Docker context. On macOS this is [Colima](https://github.com/abiosoft/colima) — if the daemon is down, StarDocker runs `colima start` for you (configure VM type, CPUs, etc. in your Colima config)
 
 ### Build from source
 
