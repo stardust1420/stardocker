@@ -13,9 +13,11 @@ go build .        # produces ./stardocker (binary is gitignored)
 go run .          # run directly; needs a reachable Docker daemon
 go vet ./...
 gofmt -l .
+docker run -d --name stardocker-test alpine:3.20 sh -c 'i=0; while true; do i=$((i+1)); echo "tick $i"; sleep 2; done'   # test container that keeps logging; remove with docker rm -f stardocker-test
 ```
 
 There are no tests in the repo yet. If adding them, `go test ./src/... -run TestName` runs a single test.
+The TUI needs a real TTY, so Claude can't drive it. Check changes with build + vet, then have the user run `! go run .`.
 
 ## Architecture
 
