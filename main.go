@@ -6,7 +6,7 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/stardust1405/stardocker/src"
+	"github.com/stardust1420/stardocker/src"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/docker/go-sdk/client"

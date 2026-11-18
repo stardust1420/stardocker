@@ -1,4 +1,4 @@
-module github.com/stardust1405/stardocker
+module github.com/stardust1420/stardocker
 
 go 1.24.0
 

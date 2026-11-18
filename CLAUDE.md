@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-StarDocker is a Go terminal UI (Bubble Tea + Bubbles + Lip Gloss) for managing local Docker containers: list containers, start/stop them, group Docker Compose stacks, and tail logs. Module path: `github.com/stardust1405/stardocker` (Go 1.24).
+StarDocker is a Go terminal UI (Bubble Tea + Bubbles + Lip Gloss) for managing local Docker containers: list containers, start/stop them, group Docker Compose stacks, and tail logs. Module path: `github.com/stardust1420/stardocker` (Go 1.24).
 
 ## Commands
 

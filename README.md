@@ -47,7 +47,7 @@ StarDocker connects directly to your local Docker daemon via the Docker SDK. It 
 ### Build from source
 
 ```bash
-git clone https://github.com/stardust1405/stardocker.git
+git clone https://github.com/stardust1420/stardocker.git
 cd stardocker
 go build .
 ```
