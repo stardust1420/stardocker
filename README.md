@@ -44,9 +44,9 @@ go install github.com/stardust1420/stardocker@latest && stardocker
 
 ### Containers
 
-Every container, with Compose stacks folded into one row you can expand. The state column tells you at a glance: `●` running, `◐` paused or a partly running stack, `○` stopped. The panel underneath shows the selected row in full, so nothing is lost to truncation.
+Every container as a card, with Compose stacks grouped under a heading you can fold with `Enter`. The dot tells you the state at a glance: `●` running, `◐` paused or a partly running stack, `○` stopped. Each card shows the image, ports, live CPU and memory, and status.
 
-<img src="docs/screenshots/containers.png" alt="Containers screen: a Compose stack expanded into three services with ports, CPU, memory and status, and a details panel below" width="100%">
+<img src="docs/screenshots/containers.png" alt="Containers screen: a Compose stack heading over three service cards with image, ports, CPU, memory and status, and a standalone container below" width="100%">
 
 ### Logs
 
@@ -151,7 +151,7 @@ Press `?` on any list to see every key for that screen.
 | `P` | Delete all stopped containers |
 
 - CPU is per core, so 200% means two full cores. It appears one second after memory, because it's measured between two samples.
-- Deleting a running container force-removes it (the prompt warns you). Deleting a stack row deletes all its containers. Volumes are always kept.
+- Deleting a running container force-removes it (the prompt warns you). Deleting a stack deletes all its containers. Volumes are always kept.
 
 ### Logs
 
