@@ -31,7 +31,7 @@ func TestHumanSize(t *testing.T) {
 
 func TestHumanDuration(t *testing.T) {
 	cases := map[time.Duration]string{
-		10 * time.Second:     "seconds",
+		10 * time.Second:     "a few seconds",
 		time.Minute:          "1 minute",
 		5 * time.Hour:        "5 hours",
 		3 * 24 * time.Hour:   "3 days",

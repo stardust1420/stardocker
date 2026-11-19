@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,9 +32,11 @@ func newTickID() int {
 	return int(lastTickID.Add(1))
 }
 
-// containerActionMsg reports the result of an async start or stop.
+// containerActionMsg reports the result of an async start, stop or delete.
+// done is the success message to show; empty means just clear the status.
 type containerActionMsg struct {
-	err error
+	err  error
+	done string
 }
 
 // List Containers Model
@@ -48,8 +51,10 @@ type listContainersModel struct {
 	items           []Container // items[i] is the container or stack shown in table row i
 	ShowChildrenSet StringSet
 	tickID          int
-	status          string
-	running         int // header counts, across stacks and standalone containers
+	status          statusLine
+	listErr         string         // set while listing containers fails
+	confirm         *confirmPrompt // pending delete, if any
+	running         int            // header counts, across stacks and standalone containers
 	stopped         int
 }
 
@@ -121,16 +126,28 @@ func (l listContainersModel) Init() tea.Cmd {
 func (l *listContainersModel) refresh() {
 	allContainers, err := FetchContainers(l.dockerClient)
 	if err != nil {
-		l.status = fmt.Sprintf("error listing containers: %v", err)
+		l.listErr = fmt.Sprintf("Can't list containers: %v", err)
 		return
 	}
+	l.listErr = ""
+	// Keep the cursor on the same container or stack, not the same row
+	// number, so rows appearing or disappearing above it don't move it.
+	prev := ""
+	if c := l.selected(); c != nil {
+		prev = itemKey(*c)
+	}
+
 	rows, items := l.getRows(allContainers)
 	l.items = items
 	l.table.SetRows(rows)
-	// SetRows doesn't clamp the cursor when rows disappear.
-	if n := len(rows); l.table.Cursor() >= n {
-		l.table.SetCursor(max(0, n-1))
+	cursor := min(l.table.Cursor(), max(0, len(rows)-1)) // SetRows doesn't clamp
+	for i, it := range items {
+		if prev != "" && itemKey(it) == prev {
+			cursor = i
+			break
+		}
 	}
+	l.table.SetCursor(cursor)
 
 	l.running, l.stopped = 0, 0
 	for _, c := range allContainers {
@@ -147,6 +164,26 @@ func (l *listContainersModel) refresh() {
 	}
 
 	l.layout()
+}
+
+// itemKey identifies a row's container or stack across refreshes.
+func itemKey(c Container) string {
+	if c.Type == TypeComposeStack {
+		return "stack:" + c.Name
+	}
+	return "container:" + c.ID
+}
+
+// resume prepares a containers screen that is being returned to (from the
+// logs view) with its cursor and expanded stacks intact. It gets a new tick
+// id so a tick left over from before can't start a second refresh loop, and
+// the current window size in case the terminal was resized meanwhile.
+func (l listContainersModel) resume(width, height int) listContainersModel {
+	l.width, l.height = width, height
+	l.tickID = newTickID()
+	l.confirm = nil
+	l.layout()
+	return l
 }
 
 // layout fits the table to the window: full page width, and whatever height
@@ -178,6 +215,21 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return l, nil
 
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return l, tea.Quit
+		}
+		// While a delete is waiting for confirmation, only y / n / esc count.
+		if l.confirm != nil {
+			run, done := handleConfirmKey(l.confirm, msg)
+			if done {
+				if run != nil {
+					l.status.set(l.tickID, statusProgress, l.confirm.progress)
+				}
+				l.confirm = nil
+			}
+			return l, run
+		}
+
 		// Handle help
 		switch {
 		case key.Matches(msg, l.keys.Help):
@@ -188,8 +240,14 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 
 		case "esc":
-			m := InitIndexModel(l.dockerClient, l.width, l.height)
+			m := InitIndexModel(l.dockerClient, l.width, l.height).withSelected(cardContainers)
 			return m, m.Init()
+
+		case "d":
+			if c := l.selected(); c != nil {
+				l.confirm = deleteContainerPrompt(l.dockerClient, *c)
+			}
+			return l, nil
 
 		case "enter":
 			c := l.selected()
@@ -201,6 +259,8 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case TypeContainer:
 				lm := InitLogsModel(l.dockerClient, c.ID, c.Name, l.width, l.height)
+				back := l // returned as-is on esc, cursor and expanded stacks included
+				lm.back = &back
 				return lm, lm.Init()
 
 			case TypeComposeStack:
@@ -215,28 +275,31 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			return l, tea.Quit
 
-		case "r":
+		case "s":
 			c := l.selected()
-			if c == nil || c.Type != TypeContainer {
+			if c == nil {
 				return l, nil
 			}
-			switch c.State {
-			case containerTypes.StateRunning:
-				l.status = "stopping " + c.Name + "..."
-				return l, stopContainerCmd(l.dockerClient, c.ID)
-			case containerTypes.StateExited, containerTypes.StateCreated:
-				l.status = "starting " + c.Name + "..."
-				return l, startContainerCmd(l.dockerClient, c.ID)
+			plan, ok := planStartStop(*c)
+			if !ok {
+				return l, nil
 			}
+			l.status.set(l.tickID, statusProgress, plan.progress)
+			return l, startStopCmd(l.dockerClient, plan)
 		}
 
 	case containerActionMsg:
+		var clear tea.Cmd
 		if msg.err != nil {
-			l.status = msg.err.Error()
+			l.status.set(l.tickID, statusError, msg.err.Error())
 		} else {
-			l.status = ""
+			clear = l.status.set(l.tickID, statusSuccess, msg.done)
 		}
 		l.refresh()
+		return l, clear
+
+	case clearStatusMsg:
+		l.status.clear(msg, l.tickID)
 		return l, nil
 
 	case tickMsg:
@@ -256,11 +319,21 @@ func (l listContainersModel) View() string {
 	width := pageWidth(l.width)
 	title, lines := l.details()
 
+	panel := renderPanel(width, title, detailsBody(width, lines), detailsLines)
+	if l.confirm != nil {
+		panel = renderConfirmPanel(width, l.confirm)
+	}
+
+	status := l.status.render()
+	if l.listErr != "" {
+		status = statusLine{text: l.listErr, kind: statusError}.render()
+	}
+
 	return renderListPage(
 		renderHeader(width, stateCounts(l.running, l.stopped), "Containers"),
 		tableBaseStyle.Render(l.table.View()),
-		renderPanel(width, title, detailsBody(width, lines), detailsLines),
-		renderBottomBar(width, l.help.View(l.keys), l.status),
+		panel,
+		renderBottomBar(width, l.help.View(l.keys), status),
 	)
 }
 
@@ -502,25 +575,163 @@ func (l listContainersModel) getRows(containers []Container) ([]table.Row, []Con
 	return rows, items
 }
 
-// startContainerCmd and stopContainerCmd run off the UI goroutine so a slow
-// stop (Docker waits up to 10s before killing) doesn't freeze the screen.
-func startContainerCmd(dockerClient client.SDKClient, containerID string) tea.Cmd {
-	return func() tea.Msg {
-		err := dockerClient.ContainerStart(context.Background(), containerID, containerTypes.StartOptions{})
-		if err != nil {
-			err = fmt.Errorf("error starting container: %w", err)
+// startStopPlan is what "s" will do for the selected row.
+type startStopPlan struct {
+	start    bool        // start the targets (false: stop them)
+	targets  []Container // containers to act on
+	progress string      // status while it runs
+	done     string      // status when it succeeded
+}
+
+// canStart reports whether "s" starts a container in this state.
+func canStart(state string) bool {
+	return state == containerTypes.StateExited || state == containerTypes.StateCreated
+}
+
+// planStartStop decides what "s" does:
+//   - a container: stop it if running, start it if exited or created;
+//   - a compose stack: if any service is running, stop every running one;
+//     if none is, start them all. (Starting the rest of a partly running
+//     stack instead would make a stack with a one-shot service, which exits
+//     on its own, impossible to stop with "s".)
+//
+// ok is false when there is nothing to do (e.g. a paused container).
+func planStartStop(c Container) (plan startStopPlan, ok bool) {
+	if c.Type != TypeComposeStack {
+		switch {
+		case c.State == containerTypes.StateRunning:
+			return startStopPlan{false, []Container{c}, "Stopping " + c.Name + "…", "Stopped " + c.Name}, true
+		case canStart(c.State):
+			return startStopPlan{true, []Container{c}, "Starting " + c.Name + "…", "Started " + c.Name}, true
 		}
-		return containerActionMsg{err: err}
+		return startStopPlan{}, false
+	}
+
+	var running, startable []Container
+	for _, child := range c.Children {
+		switch {
+		case child.State == containerTypes.StateRunning:
+			running = append(running, child)
+		case canStart(child.State):
+			startable = append(startable, child)
+		}
+	}
+	count := func(n int) string {
+		if n == 1 {
+			return "1 container"
+		}
+		return fmt.Sprintf("%d containers", n)
+	}
+	if len(running) > 0 {
+		n := count(len(running))
+		return startStopPlan{false, running, "Stopping " + n + " in " + c.Name + "…", "Stopped " + n + " in " + c.Name}, true
+	}
+	if len(startable) > 0 {
+		n := count(len(startable))
+		return startStopPlan{true, startable, "Starting " + n + " in " + c.Name + "…", "Started " + n + " in " + c.Name}, true
+	}
+	return startStopPlan{}, false
+}
+
+// startStopCmd carries out a plan off the UI goroutine, acting on all
+// targets in parallel: a stop can take up to 10s per container while Docker
+// waits before killing it, which would freeze the screen or add up.
+func startStopCmd(dockerClient client.SDKClient, plan startStopPlan) tea.Cmd {
+	return func() tea.Msg {
+		var (
+			wg     sync.WaitGroup
+			mu     sync.Mutex
+			failed []string
+		)
+		for _, t := range plan.targets {
+			wg.Add(1)
+			go func(t Container) {
+				defer wg.Done()
+				var err error
+				if plan.start {
+					err = dockerClient.ContainerStart(context.Background(), t.ID, containerTypes.StartOptions{})
+				} else {
+					err = dockerClient.ContainerStop(context.Background(), t.ID, containerTypes.StopOptions{})
+				}
+				if err != nil {
+					mu.Lock()
+					failed = append(failed, fmt.Sprintf("%s: %v", t.Name, err))
+					mu.Unlock()
+				}
+			}(t)
+		}
+		wg.Wait()
+
+		if len(failed) > 0 {
+			verb := "stop"
+			if plan.start {
+				verb = "start"
+			}
+			sort.Strings(failed)
+			return containerActionMsg{err: fmt.Errorf("couldn't %s %s", verb, strings.Join(failed, "; "))}
+		}
+		return containerActionMsg{done: plan.done}
 	}
 }
 
-func stopContainerCmd(dockerClient client.SDKClient, containerID string) tea.Cmd {
-	return func() tea.Msg {
-		err := dockerClient.ContainerStop(context.Background(), containerID, containerTypes.StopOptions{})
-		if err != nil {
-			err = fmt.Errorf("error stopping container: %w", err)
+// deleteContainerPrompt builds the confirmation for deleting a container,
+// or every container of a compose stack.
+func deleteContainerPrompt(dockerClient client.SDKClient, c Container) *confirmPrompt {
+	if c.Type == TypeComposeStack {
+		running := 0
+		for _, child := range c.Children {
+			if child.State == containerTypes.StateRunning {
+				running++
+			}
 		}
-		return containerActionMsg{err: err}
+		noun := "containers"
+		if len(c.Children) == 1 {
+			noun = "container"
+		}
+		lines := []string{}
+		if running > 0 {
+			lines = append(lines, fmt.Sprintf("%d of them are running and will be stopped first.", running))
+		}
+		lines = append(lines, "Their logs and any files changed inside them are lost. Volumes and networks are kept.")
+		return &confirmPrompt{
+			title:    fmt.Sprintf("Delete all %d %s in %s?", len(c.Children), noun, c.Name),
+			lines:    lines,
+			progress: "Deleting " + c.Name + "…",
+			run:      deleteContainersCmd(dockerClient, c.Children, fmt.Sprintf("Deleted %d %s in %s", len(c.Children), noun, c.Name)),
+		}
+	}
+
+	lines := []string{}
+	if c.State == containerTypes.StateRunning {
+		lines = append(lines, "It's running, so it will be stopped and then deleted.")
+	}
+	lines = append(lines, "Its logs and any files changed inside it are lost. Volumes are kept.")
+	return &confirmPrompt{
+		title:    "Delete " + c.Name + "?",
+		lines:    lines,
+		progress: "Deleting " + c.Name + "…",
+		run:      deleteContainersCmd(dockerClient, []Container{c}, "Deleted "+c.Name),
+	}
+}
+
+// deleteContainersCmd removes the containers off the UI goroutine. Running
+// ones are force-removed (stopped first), which the prompt has said; volumes
+// are never removed.
+func deleteContainersCmd(dockerClient client.SDKClient, targets []Container, done string) tea.Cmd {
+	return func() tea.Msg {
+		var failed []string
+		for _, t := range targets {
+			err := dockerClient.ContainerRemove(context.Background(), t.ID, containerTypes.RemoveOptions{
+				Force: t.State == containerTypes.StateRunning,
+			})
+			if err != nil {
+				failed = append(failed, fmt.Sprintf("%s: %v", t.Name, err))
+			}
+		}
+		if len(failed) > 0 {
+			return containerActionMsg{err: fmt.Errorf("couldn't delete %s", strings.Join(failed, "; "))}
+		}
+		return containerActionMsg{done: done}
 	}
 }
 

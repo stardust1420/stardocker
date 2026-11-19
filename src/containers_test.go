@@ -1,9 +1,11 @@
 package src
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/table"
+	tea "github.com/charmbracelet/bubbletea"
 	containerTypes "github.com/docker/docker/api/types/container"
 )
 
@@ -105,5 +107,58 @@ func TestGetRowsItemsAligned(t *testing.T) {
 	}
 	if rows[1][2] != "aaaaaaaaaaaa" {
 		t.Errorf("child ID cell = %q; want short ID without indent", rows[1][2])
+	}
+}
+
+func TestPlanStartStop(t *testing.T) {
+	web := Container{Name: "web", Type: TypeContainer, State: containerTypes.StateRunning}
+	db := Container{Name: "db", Type: TypeContainer, State: containerTypes.StateRunning}
+	worker := Container{Name: "worker", Type: TypeContainer, State: containerTypes.StateExited}
+	fresh := Container{Name: "fresh", Type: TypeContainer, State: containerTypes.StateCreated}
+	paused := Container{Name: "paused", Type: TypeContainer, State: containerTypes.StatePaused}
+
+	names := func(cs []Container) []string {
+		out := []string{}
+		for _, c := range cs {
+			out = append(out, c.Name)
+		}
+		return out
+	}
+
+	if p, ok := planStartStop(web); !ok || p.start || p.done != "Stopped web" {
+		t.Errorf("running container: %+v %v", p, ok)
+	}
+	if p, ok := planStartStop(fresh); !ok || !p.start || p.done != "Started fresh" {
+		t.Errorf("created container: %+v %v", p, ok)
+	}
+	if _, ok := planStartStop(paused); ok {
+		t.Error("paused container: s should do nothing")
+	}
+
+	// Partly running stack: stop only the running services.
+	p, ok := planStartStop(composeStackSummary("demo", []Container{db, web, worker}))
+	if !ok || p.start || strings.Join(names(p.targets), ",") != "db,web" || p.progress != "Stopping 2 containers in demo…" {
+		t.Errorf("partial stack: %+v %v", p, ok)
+	}
+
+	// Fully stopped stack: start everything that can start.
+	stopped := composeStackSummary("demo", []Container{worker, fresh, paused})
+	p, ok = planStartStop(stopped)
+	if !ok || !p.start || strings.Join(names(p.targets), ",") != "worker,fresh" || p.done != "Started 2 containers in demo" {
+		t.Errorf("stopped stack: %+v %v", p, ok)
+	}
+}
+
+func TestEscReturnsHomeWithCardSelected(t *testing.T) {
+	esc := tea.KeyMsg{Type: tea.KeyEsc}
+
+	m, _ := InitListImagesModel(nil, 120, 40).Update(esc)
+	if home, ok := m.(indexModel); !ok || home.selected != cardImages {
+		t.Errorf("from images: got %T selected=%v", m, m)
+	}
+
+	m, _ = InitListContainersModel(nil, 120, 40).Update(esc)
+	if home, ok := m.(indexModel); !ok || home.selected != cardContainers {
+		t.Errorf("from containers: got %T", m)
 	}
 }

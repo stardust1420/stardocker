@@ -61,6 +61,7 @@ type containersKeyMap struct {
 	keyMap
 	Open   key.Binding
 	Toggle key.Binding
+	Delete key.Binding
 	Quit   key.Binding
 }
 
@@ -71,8 +72,12 @@ var containersKeys = containersKeyMap{
 		key.WithHelp("enter", "logs / expand stack"),
 	),
 	Toggle: key.NewBinding(
-		key.WithKeys("r"),
-		key.WithHelp("r", "start/stop container"),
+		key.WithKeys("s"),
+		key.WithHelp("s", "start/stop"),
+	),
+	Delete: key.NewBinding(
+		key.WithKeys("d"),
+		key.WithHelp("d", "delete"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
@@ -81,13 +86,40 @@ var containersKeys = containersKeyMap{
 }
 
 func (k containersKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Toggle, k.Open, k.Help}
+	return []key.Binding{k.Open, k.Toggle, k.Delete, k.Left, k.Help}
 }
 
 func (k containersKeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Open, k.Left},
-		{k.Toggle, k.Quit, k.Help},
+		{k.Toggle, k.Delete, k.Quit, k.Help},
+	}
+}
+
+// imagesKeyMap adds delete to the shared bindings for the images screen.
+type imagesKeyMap struct {
+	keyMap
+	Delete key.Binding
+	Quit   key.Binding
+}
+
+var imagesKeys = imagesKeyMap{
+	keyMap: keys,
+	Delete: key.NewBinding(
+		key.WithKeys("d"),
+		key.WithHelp("d", "delete"),
+	),
+	Quit: containersKeys.Quit,
+}
+
+func (k imagesKeyMap) ShortHelp() []key.Binding {
+	return []key.Binding{k.Up, k.Down, k.Delete, k.Left, k.Help}
+}
+
+func (k imagesKeyMap) FullHelp() [][]key.Binding {
+	return [][]key.Binding{
+		{k.Up, k.Down, k.Left},
+		{k.Delete, k.Quit, k.Help},
 	}
 }
 

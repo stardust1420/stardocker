@@ -22,16 +22,18 @@ import (
 
 type listImagesModel struct {
 	help         help.Model
-	keys         keyMap
+	keys         imagesKeyMap
 	dockerClient client.SDKClient
 	width        int
 	height       int
 	table        table.Model
 	items        []Image // items[i] is the image shown in table row i
 	tickID       int
-	status       string
-	imageCount   int   // distinct images, for the header
-	diskUsage    int64 // their total size
+	status       statusLine
+	listErr      string         // set while listing images fails
+	confirm      *confirmPrompt // pending delete, if any
+	imageCount   int            // distinct images, for the header
+	diskUsage    int64          // their total size
 }
 
 // Image is one row of the images table. An image with several tags appears
@@ -68,7 +70,7 @@ func InitListImagesModel(dockerClient client.SDKClient, width int, height int) l
 
 	return listImagesModel{
 		help:         newHelp(),
-		keys:         keys,
+		keys:         imagesKeys,
 		dockerClient: dockerClient,
 		width:        width,
 		height:       height,
@@ -90,17 +92,28 @@ func (l listImagesModel) Init() tea.Cmd {
 func (l *listImagesModel) refresh() {
 	images, err := FetchImages(l.dockerClient)
 	if err != nil {
-		l.status = fmt.Sprintf("error listing images: %v", err)
+		l.listErr = fmt.Sprintf("Can't list images: %v", err)
 		return
 	}
-	l.status = ""
+	l.listErr = ""
+
+	// Keep the cursor on the same image tag, not the same row number.
+	prev := ""
+	if i := l.table.Cursor(); i >= 0 && i < len(l.items) {
+		prev = imageRef(l.items[i])
+	}
+
 	rows := imageRows(images, time.Now())
 	l.items = images
 	l.table.SetRows(rows)
-	// SetRows doesn't clamp the cursor when rows disappear.
-	if n := len(l.table.Rows()); l.table.Cursor() >= n {
-		l.table.SetCursor(max(0, n-1))
+	cursor := min(l.table.Cursor(), max(0, len(rows)-1)) // SetRows doesn't clamp
+	for i, img := range images {
+		if prev != "" && imageRef(img) == prev {
+			cursor = i
+			break
+		}
 	}
+	l.table.SetCursor(cursor)
 
 	// An image with several tags has several rows; count it once.
 	seen := make(map[string]bool)
@@ -135,6 +148,21 @@ func (l listImagesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return l, nil
 
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return l, tea.Quit
+		}
+		// While a delete is waiting for confirmation, only y / n / esc count.
+		if l.confirm != nil {
+			run, done := handleConfirmKey(l.confirm, msg)
+			if done {
+				if run != nil {
+					l.status.set(l.tickID, statusProgress, l.confirm.progress)
+				}
+				l.confirm = nil
+			}
+			return l, run
+		}
+
 		// Handle help
 		switch {
 		case key.Matches(msg, l.keys.Help):
@@ -143,12 +171,37 @@ func (l listImagesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "q":
 			return l, tea.Quit
 		case "esc":
-			m := InitIndexModel(l.dockerClient, l.width, l.height)
+			m := InitIndexModel(l.dockerClient, l.width, l.height).withSelected(cardImages)
 			return m, m.Init()
+		case "d":
+			i := l.table.Cursor()
+			if i < 0 || i >= len(l.items) {
+				return l, nil
+			}
+			prompt, refusal := deleteImagePrompt(l.dockerClient, l.items[i], l.items)
+			if refusal != "" {
+				return l, l.status.set(l.tickID, statusError, refusal)
+			}
+			l.confirm = prompt
+			return l, nil
 		}
+
+	case imageActionMsg:
+		var clear tea.Cmd
+		if msg.err != nil {
+			l.status.set(l.tickID, statusError, msg.err.Error())
+		} else {
+			clear = l.status.set(l.tickID, statusSuccess, msg.done)
+		}
+		l.refresh()
+		return l, clear
+
+	case clearStatusMsg:
+		l.status.clear(msg, l.tickID)
+		return l, nil
 
 	case tickMsg:
 		if msg.id != l.tickID {
@@ -174,11 +227,21 @@ func (l listImagesModel) View() string {
 	info := crumbStyle.Render(strconv.Itoa(l.imageCount)) + mutedStyle.Render(" "+noun+"   ") +
 		crumbStyle.Render(humanSize(l.diskUsage)) + mutedStyle.Render(" on disk")
 
+	panel := renderPanel(width, title, detailsBody(width, lines), detailsLines)
+	if l.confirm != nil {
+		panel = renderConfirmPanel(width, l.confirm)
+	}
+
+	status := l.status.render()
+	if l.listErr != "" {
+		status = statusLine{text: l.listErr, kind: statusError}.render()
+	}
+
 	return renderListPage(
 		renderHeader(width, info, "Images"),
 		tableBaseStyle.Render(l.table.View()),
-		renderPanel(width, title, detailsBody(width, lines), detailsLines),
-		renderBottomBar(width, l.help.View(l.keys), l.status),
+		panel,
+		renderBottomBar(width, l.help.View(l.keys), status),
 	)
 }
 
@@ -201,6 +264,83 @@ func (l listImagesModel) details() (string, []detailLine) {
 		{"Size", humanSize(img.Size)},
 		{"Created", fmt.Sprintf("%s, %s ago", img.Created.Format("2 Jan 2006 15:04"), humanDuration(time.Since(img.Created)))},
 		{"Used by", usedBy},
+	}
+}
+
+// imageActionMsg reports the result of an async image delete.
+type imageActionMsg struct {
+	err  error
+	done string
+}
+
+// imageRef is what to pass to Docker to delete this row: the repo:tag, or
+// the ID for an untagged image.
+func imageRef(img Image) string {
+	if img.Repository == "<none>" {
+		return img.ID
+	}
+	return img.Repository + ":" + img.Tag
+}
+
+// imageLabel is how the image is named to the user.
+func imageLabel(img Image) string {
+	if img.Repository == "<none>" {
+		return "untagged image " + shortImageID(img.ID)
+	}
+	return img.Repository + ":" + img.Tag
+}
+
+// deleteImagePrompt builds the confirmation for deleting the image in this
+// row. It refuses (returning a message instead) to delete an image that
+// containers still use, because Docker would refuse too unless forced, and
+// forcing would leave those containers pointing at a missing image.
+func deleteImagePrompt(dockerClient client.SDKClient, img Image, all []Image) (*confirmPrompt, string) {
+	label := imageLabel(img)
+
+	// Other rows with the same ID are other tags of the same image.
+	var otherTags []string
+	for _, other := range all {
+		if other.ID == img.ID && imageRef(other) != imageRef(img) {
+			otherTags = append(otherTags, imageLabel(other))
+		}
+	}
+
+	// Removing one of several tags never deletes the image, so it's safe
+	// even while containers use it. Deleting the image itself is not.
+	if len(otherTags) == 0 && img.Containers > 0 {
+		noun := "containers"
+		if img.Containers == 1 {
+			noun = "container"
+		}
+		return nil, fmt.Sprintf("%s is in use by %d %s. Delete those first.", label, img.Containers, noun)
+	}
+
+	if len(otherTags) > 0 {
+		return &confirmPrompt{
+			title:    "Remove the tag " + label + "?",
+			lines:    []string{"Only this tag goes. The image stays, because it's also tagged " + strings.Join(otherTags, ", ") + "."},
+			progress: "Removing " + label + "…",
+			run:      deleteImageCmd(dockerClient, imageRef(img), "Removed the tag "+label),
+		}, ""
+	}
+
+	return &confirmPrompt{
+		title: "Delete " + label + "?",
+		lines: []string{
+			"Frees " + humanSize(img.Size) + ". You'd need to pull or build it again to use it.",
+		},
+		progress: "Deleting " + label + "…",
+		run:      deleteImageCmd(dockerClient, imageRef(img), "Deleted "+label),
+	}, ""
+}
+
+func deleteImageCmd(dockerClient client.SDKClient, ref, done string) tea.Cmd {
+	return func() tea.Msg {
+		_, err := dockerClient.ImageRemove(context.Background(), ref, imageTypes.RemoveOptions{PruneChildren: true})
+		if err != nil {
+			return imageActionMsg{err: fmt.Errorf("couldn't delete %s: %w", ref, err)}
+		}
+		return imageActionMsg{done: done}
 	}
 }
 
@@ -325,7 +465,7 @@ func humanDuration(d time.Duration) string {
 	}
 	switch {
 	case d < time.Minute:
-		return "seconds"
+		return "a few seconds"
 	case d < time.Hour:
 		return plural(int(d.Minutes()), "minute")
 	case d < 48*time.Hour:

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -81,6 +82,7 @@ type indexModel struct {
 	selected     int
 	tickID       int
 	summary      *dockerSummary // nil until the first fetch returns
+	stars        *starfield     // the animated background; nil until the size is known
 }
 
 func InitIndexModel(dockerClient client.SDKClient, width int, height int) indexModel {
@@ -91,11 +93,34 @@ func InitIndexModel(dockerClient client.SDKClient, width int, height int) indexM
 		width:        width,
 		height:       height,
 		tickID:       newTickID(),
+		stars:        newHomeStarfield(width, height),
 	}
 }
 
+// newHomeStarfield builds the background for a window of this size, or nil
+// if the size isn't known yet.
+func newHomeStarfield(width, height int) *starfield {
+	if width <= 0 || height <= 0 {
+		return nil
+	}
+	return newStarfield(width, height, uint64(time.Now().UnixNano()))
+}
+
+// withSelected returns the home screen with the given card selected. The
+// list screens use it on esc so the card you came from stays selected.
+func (m indexModel) withSelected(card int) indexModel {
+	if card >= 0 && card < len(menuCards) {
+		m.selected = card
+	}
+	return m
+}
+
 func (m indexModel) Init() tea.Cmd {
-	return tea.Batch(tea.SetWindowTitle("StarDocker"), fetchSummaryCmd(m.dockerClient, m.tickID))
+	cmds := []tea.Cmd{tea.SetWindowTitle("StarDocker"), fetchSummaryCmd(m.dockerClient, m.tickID)}
+	if !reducedMotion() {
+		cmds = append(cmds, frameCmd(m.tickID))
+	}
+	return tea.Batch(cmds...)
 }
 
 // fetchSummaryCmd loads the card counts off the UI goroutine.
@@ -150,7 +175,17 @@ func (m indexModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.stars = newHomeStarfield(msg.Width, msg.Height)
 		return m, nil
+
+	case frameMsg:
+		if msg.id != m.tickID {
+			return m, nil
+		}
+		if m.stars != nil {
+			m.stars.step()
+		}
+		return m, frameCmd(m.tickID)
 
 	case summaryMsg:
 		if msg.tickID != m.tickID {
@@ -330,6 +365,11 @@ func (m indexModel) View() string {
 
 	if m.width <= 0 || m.height <= 0 {
 		return page
+	}
+	if m.stars != nil {
+		if sky := m.stars.compose(page); sky != "" {
+			return sky
+		}
 	}
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, page)
 }
