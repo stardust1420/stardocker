@@ -1,38 +1,29 @@
 package src
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/lipgloss"
+)
 
-// Index Styles
-var TitleStyle = lipgloss.NewStyle().
-	Foreground(lipgloss.Color("#020202ff")).
-	Background(lipgloss.Color("#f9a318ff")).
-	MarginLeft(5).
-	Padding(2, 3, 0, 0)
+// Colours and shared text styles live in layout.go.
 
-var ContentStyle = lipgloss.NewStyle().
-	Foreground(lipgloss.Color("#020202ff")).
-	Background(lipgloss.Color("#6bc6ffff")).
-	Padding(1, 3, 0, 2).
-	Width(30).Height(20).
-	MarginLeft(5).
-	Bold(true)
+var tableBaseStyle = lipgloss.NewStyle().
+	BorderStyle(lipgloss.NormalBorder()).
+	BorderForeground(colorBorder)
 
-var HelpStyle = lipgloss.NewStyle().
-	MarginLeft(5)
-
-// Containers Styles
-var ContainerTitleStyle = lipgloss.NewStyle().
-	Bold(true).
-	Foreground(lipgloss.Color("#020202ff")).
-	Background(lipgloss.Color("#f9a318ff")).
-	MarginLeft(1).
-	Padding(1).
-	Width(70)
-
-var ContainerContentStyle = lipgloss.NewStyle().
-	Bold(true).
-	Foreground(lipgloss.Color("#020202ff")).
-	Background(lipgloss.Color("#6bc6ffff")).
-	Padding(1).
-	Width(70).
-	MarginLeft(1)
+// tableStyles is the shared look of every table: quiet grey headings over a
+// rule, and the selected row in steel blue so orange stays the brand colour.
+func tableStyles() table.Styles {
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(colorBorder).
+		BorderBottom(true).
+		Foreground(colorMuted).
+		Bold(true)
+	s.Selected = s.Selected.
+		Foreground(lipgloss.Color("#ffffff")).
+		Background(colorSteel).
+		Bold(true)
+	return s
+}

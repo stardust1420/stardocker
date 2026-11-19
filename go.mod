@@ -9,7 +9,6 @@ require (
 	github.com/docker/docker v28.3.2+incompatible
 	github.com/docker/go-sdk/client v0.1.0-alpha011
 	github.com/muesli/reflow v0.3.0
-	go.mongodb.org/mongo-driver v1.17.6
 )
 
 require (
