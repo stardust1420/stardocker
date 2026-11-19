@@ -13,7 +13,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	containerTypes "github.com/docker/docker/api/types/container"
@@ -30,9 +29,9 @@ type listImagesModel struct {
 	dockerClient client.SDKClient
 	width        int
 	height       int
-	table        table.Model
+	grid         gridView
 	all          []Image // the latest fetch, before filtering and sorting
-	items        []Image // items[i] is the image shown in table row i
+	items        []Image // items[i] is the image on grid card i
 	tickID       int
 	status       statusLine
 	listErr      string         // set while listing images fails
@@ -57,18 +56,6 @@ type Image struct {
 	UsedBy     []string // names of the containers created from this image
 }
 
-// imageColumns: Repository and Used by keep their width longest.
-var imageColumns = []colSpec{
-	{title: " ", min: 1, max: 1},
-	{title: "Repository", min: 15, max: 50, shrinkOrder: 3, grow: 3},
-	{title: "Tag", min: 8, max: 25, shrinkOrder: 2, grow: 1},
-	{title: "Image ID", min: 12, max: 12},
-	{title: "Size", min: 7, max: 8},
-	{title: "Created", min: 10, max: 16, shrinkOrder: 1},
-	{title: "Containers", min: 10, max: 10},
-	{title: "Used by", min: 10, max: 60, shrinkOrder: 2, grow: 3},
-}
-
 // imageSorts are the orders "o" cycles through. The first keeps the order
 // FetchImages returns (by name, untagged last).
 var imageSorts = []struct {
@@ -81,23 +68,18 @@ var imageSorts = []struct {
 }
 
 func InitListImagesModel(dockerClient client.SDKClient, width int, height int) listImagesModel {
-	t := table.New(
-		table.WithColumns(fitColumns(imageColumns, nil, pageWidth(width))),
-		table.WithFocused(true),
-		table.WithHeight(listTableHeight(height, 1)),
-	)
-	t.SetStyles(tableStyles())
-
-	return listImagesModel{
+	l := listImagesModel{
 		help:         newHelp(),
 		keys:         imagesKeys,
 		dockerClient: dockerClient,
 		width:        width,
 		height:       height,
-		table:        t,
+		grid:         gridView{cursor: -1},
 		tickID:       newTickID(),
 		filter:       newFilterBar(),
 	}
+	l.layout()
+	return l
 }
 
 func (l listImagesModel) Init() tea.Cmd {
@@ -148,34 +130,28 @@ func (l listImagesModel) visible() []Image {
 	return out
 }
 
-// rebuild fills the table, keeping the cursor on the same image tag, not
-// the same row number.
+// rebuild fills the grid. The grid keeps the cursor on the same image tag
+// (by imageRef), not the same position.
 func (l *listImagesModel) rebuild() {
-	prev := ""
-	if i := l.table.Cursor(); i >= 0 && i < len(l.items) {
-		prev = imageRef(l.items[i])
-	}
-
 	images := l.visible()
-	rows := imageRows(images, time.Now())
 	l.items = images
-	l.table.SetRows(rows)
-	cursor := min(l.table.Cursor(), max(0, len(rows)-1)) // SetRows doesn't clamp
-	for i, img := range images {
-		if prev != "" && imageRef(img) == prev {
-			cursor = i
-			break
-		}
-	}
-	l.table.SetCursor(cursor)
 	l.layout()
+	l.grid.setEntries(imageCards(images, time.Now()))
 }
 
-// layout fits the table to the window: full page width, and whatever height
-// is left after the header, details panel and help.
+// layout fits the grid to the window: full page width, and whatever height
+// is left after the header, the help and any confirmation.
 func (l *listImagesModel) layout() {
-	l.table.SetHeight(listTableHeight(l.height, lipgloss.Height(l.bottomLeft())))
-	l.table.SetColumns(fitColumns(imageColumns, l.table.Rows(), pageWidth(l.width)))
+	l.grid.resize(pageWidth(l.width), listGridHeight(l.height, lipgloss.Height(l.bottomLeft()), l.confirm != nil))
+}
+
+// selected is the image under the cursor, or nil.
+func (l listImagesModel) selected() *Image {
+	i := l.grid.cursor
+	if i < 0 || i >= len(l.items) {
+		return nil
+	}
+	return &l.items[i]
 }
 
 // bottomLeft is the help, or the field being typed in.
@@ -191,8 +167,6 @@ func (l listImagesModel) bottomLeft() string {
 }
 
 func (l listImagesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
@@ -213,6 +187,7 @@ func (l listImagesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					l.status.set(l.tickID, statusProgress, l.confirm.progress)
 				}
 				l.confirm = nil
+				l.layout()
 			}
 			return l, run
 		}
@@ -257,8 +232,8 @@ func (l listImagesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return l, nil
 			}
 			f := textField{limit: 200, accept: func(r rune, _ string) bool { return r != ' ' }}
-			if i := l.table.Cursor(); i >= 0 && i < len(l.items) && l.items[i].Repository != "<none>" {
-				f.value = imageRef(l.items[i])
+			if img := l.selected(); img != nil && img.Repository != "<none>" {
+				f.value = imageRef(*img)
 			}
 			l.pullInput = &f
 			l.layout()
@@ -275,19 +250,23 @@ func (l listImagesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return l, l.status.set(l.tickID, statusSuccess, refusal)
 			}
 			l.confirm = prompt
+			l.layout()
 			return l, nil
 		case "d":
-			i := l.table.Cursor()
-			if i < 0 || i >= len(l.items) {
+			img := l.selected()
+			if img == nil {
 				return l, nil
 			}
-			prompt, refusal := deleteImagePrompt(l.dockerClient, l.items[i], l.all)
+			prompt, refusal := deleteImagePrompt(l.dockerClient, *img, l.all)
 			if refusal != "" {
 				return l, l.status.set(l.tickID, statusError, refusal)
 			}
 			l.confirm = prompt
+			l.layout()
 			return l, nil
 		}
+		l.grid.handleKey(msg)
+		return l, nil
 
 	case pullProgressMsg:
 		l.status.set(l.tickID, statusProgress, msg.text)
@@ -316,9 +295,7 @@ func (l listImagesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return l, tickCmd(l.tickID)
 	}
 
-	l.table, cmd = l.table.Update(msg)
-
-	return l, cmd
+	return l, nil
 }
 
 // updatePullInput handles keys while the "pull image" field is open.
@@ -345,7 +322,6 @@ func (l listImagesModel) updatePullInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (l listImagesModel) View() string {
 	width := pageWidth(l.width)
-	title, lines := l.details()
 
 	noun := "images"
 	if l.imageCount == 1 {
@@ -357,7 +333,7 @@ func (l listImagesModel) View() string {
 		info = mutedStyle.Render("by "+imageSorts[l.sortBy].label+"   ") + info
 	}
 
-	panel := renderPanel(width, title, detailsBody(width, lines), detailsLines)
+	panel := ""
 	if l.confirm != nil {
 		panel = renderConfirmPanel(width, l.confirm)
 	}
@@ -367,34 +343,17 @@ func (l listImagesModel) View() string {
 		status = statusLine{text: l.listErr, kind: statusError}.render()
 	}
 
-	return renderListPage(
+	empty := "No images yet. Press p to pull one."
+	if l.filter.query() != "" {
+		empty = "Nothing matches /" + l.filter.query() + ". Press esc to clear the filter."
+	}
+
+	return renderGridPage(
 		renderHeader(width, info, withFilterCrumb(l.filter, "Images")...),
-		tableBaseStyle.Render(l.table.View()),
+		l.grid.view(empty),
 		panel,
 		renderBottomBar(width, l.bottomLeft(), status),
 	)
-}
-
-// details describes the selected image in full, so nothing is lost when
-// table columns are truncated. It returns the panel title and its lines.
-func (l listImagesModel) details() (string, []detailLine) {
-	i := l.table.Cursor()
-	if i < 0 || i >= len(l.items) {
-		return "", nil
-	}
-	img := l.items[i]
-
-	usedBy := "No containers"
-	if len(img.UsedBy) > 0 {
-		usedBy = strings.Join(img.UsedBy, ", ")
-	}
-
-	return img.Repository + ":" + img.Tag, []detailLine{
-		{"ID", img.ID},
-		{"Size", humanSize(img.Size)},
-		{"Created", fmt.Sprintf("%s, %s ago", img.Created.Format("2 Jan 2006 15:04"), humanDuration(time.Since(img.Created)))},
-		{"Used by", usedBy},
-	}
 }
 
 // imageActionMsg reports the result of an async image delete.
@@ -531,25 +490,33 @@ func FetchImages(dockerClient client.SDKClient) ([]Image, error) {
 	return images, nil
 }
 
-func imageRows(images []Image, now time.Time) []table.Row {
-	rows := make([]table.Row, 0, len(images))
+// imageCards shows each image tag: size, age, the short ID, and the
+// containers created from it.
+func imageCards(images []Image, now time.Time) []gridEntry {
+	entries := make([]gridEntry, 0, len(images))
 	for _, img := range images {
-		indicator := glyphStopped
+		glyph := glyphStopped
 		if img.Containers > 0 {
-			indicator = glyphRunning
+			glyph = glyphRunning
 		}
-		rows = append(rows, table.Row{
-			indicator,
-			img.Repository,
-			img.Tag,
-			shortImageID(img.ID),
-			humanSize(img.Size),
-			humanDuration(now.Sub(img.Created)) + " ago",
-			strconv.Itoa(img.Containers),
-			strings.Join(img.UsedBy, ", "),
+		title := img.Repository + ":" + img.Tag
+		if img.Repository == "<none>" {
+			title = "untagged"
+		}
+		entries = append(entries, gridEntry{
+			key:        imageRef(img),
+			selectable: true,
+			glyph:      glyphFor(glyph),
+			title:      title,
+			body: []string{
+				valueLabel(humanSize(img.Size), "on disk"),
+				mutedStyle.Render("created " + humanDuration(now.Sub(img.Created)) + " ago"),
+				mutedStyle.Render(shortImageID(img.ID)),
+				usedByLine(img.UsedBy, "No containers use it"),
+			},
 		})
 	}
-	return rows
+	return entries
 }
 
 // splitImageRef splits "registry:5000/repo:tag" into repo and tag. The tag

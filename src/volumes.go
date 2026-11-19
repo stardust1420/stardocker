@@ -10,7 +10,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	containerTypes "github.com/docker/docker/api/types/container"
@@ -29,24 +28,15 @@ type Volume struct {
 	UsedBy     []string // containers (running or not) that mount it
 }
 
-var volumeColumns = []colSpec{
-	{title: " ", min: 1, max: 1},
-	{title: "Name", min: 16, max: 66, shrinkOrder: 3, grow: 3},
-	{title: "Driver", min: 6, max: 10},
-	{title: "Project", min: 8, max: 24, shrinkOrder: 1, grow: 1},
-	{title: "Created", min: 10, max: 16, shrinkOrder: 0},
-	{title: "Used by", min: 10, max: 60, shrinkOrder: 2, grow: 2},
-}
-
 type listVolumesModel struct {
 	help         help.Model
 	keys         listKeyMap
 	dockerClient client.SDKClient
 	width        int
 	height       int
-	table        table.Model
+	grid         gridView
 	all          []Volume
-	items        []Volume
+	items        []Volume // items[i] is the volume on grid card i
 	tickID       int
 	status       statusLine
 	listErr      string
@@ -55,22 +45,18 @@ type listVolumesModel struct {
 }
 
 func InitListVolumesModel(dockerClient client.SDKClient, width, height int) listVolumesModel {
-	t := table.New(
-		table.WithColumns(fitColumns(volumeColumns, nil, pageWidth(width))),
-		table.WithFocused(true),
-		table.WithHeight(listTableHeight(height, 1)),
-	)
-	t.SetStyles(tableStyles())
-	return listVolumesModel{
+	l := listVolumesModel{
 		help:         newHelp(),
 		keys:         volumesKeys,
 		dockerClient: dockerClient,
 		width:        width,
 		height:       height,
-		table:        t,
+		grid:         gridView{cursor: -1},
 		tickID:       newTickID(),
 		filter:       newFilterBar(),
 	}
+	l.layout()
+	return l
 }
 
 func (l listVolumesModel) Init() tea.Cmd {
@@ -130,14 +116,12 @@ func (l *listVolumesModel) refresh() {
 	l.rebuild()
 }
 
+// rebuild fills the grid with the volumes that pass the filter. The grid
+// keeps the cursor on the same volume (by name).
 func (l *listVolumesModel) rebuild() {
-	prev := ""
-	if v := l.selected(); v != nil {
-		prev = v.Name
-	}
 	q := l.filter.query()
 	var items []Volume
-	var rows []table.Row
+	var entries []gridEntry
 	now := time.Now()
 	for _, v := range l.all {
 		project := v.Labels[composeStackIdentifier]
@@ -148,29 +132,30 @@ func (l *listVolumesModel) rebuild() {
 		if len(v.UsedBy) > 0 {
 			glyph = glyphRunning
 		}
-		created := ""
-		if !v.Created.IsZero() {
-			created = humanDuration(now.Sub(v.Created)) + " ago"
+		body := []string{valueLabel(v.Driver, "driver")}
+		if project != "" {
+			body = append(body, mutedStyle.Render("project ")+textLine(project))
 		}
-		rows = append(rows, table.Row{glyph, v.Name, v.Driver, project, created, strings.Join(v.UsedBy, ", ")})
+		if !v.Created.IsZero() {
+			body = append(body, mutedStyle.Render("created "+humanDuration(now.Sub(v.Created))+" ago"))
+		}
+		body = append(body, usedByLine(v.UsedBy, "No containers use it"))
+		entries = append(entries, gridEntry{
+			key:        v.Name,
+			selectable: true,
+			glyph:      glyphFor(glyph),
+			title:      v.Name,
+			body:       body,
+		})
 		items = append(items, v)
 	}
 	l.items = items
-	l.table.SetRows(rows)
-	cursor := min(l.table.Cursor(), max(0, len(rows)-1))
-	for i, v := range items {
-		if prev != "" && v.Name == prev {
-			cursor = i
-			break
-		}
-	}
-	l.table.SetCursor(cursor)
 	l.layout()
+	l.grid.setEntries(entries)
 }
 
 func (l *listVolumesModel) layout() {
-	l.table.SetHeight(listTableHeight(l.height, lipgloss.Height(l.bottomLeft())))
-	l.table.SetColumns(fitColumns(volumeColumns, l.table.Rows(), pageWidth(l.width)))
+	l.grid.resize(pageWidth(l.width), listGridHeight(l.height, lipgloss.Height(l.bottomLeft()), l.confirm != nil))
 }
 
 func (l listVolumesModel) bottomLeft() string {
@@ -181,7 +166,7 @@ func (l listVolumesModel) bottomLeft() string {
 }
 
 func (l listVolumesModel) selected() *Volume {
-	i := l.table.Cursor()
+	i := l.grid.cursor
 	if i < 0 || i >= len(l.items) {
 		return nil
 	}
@@ -206,6 +191,7 @@ func (l listVolumesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					l.status.set(l.tickID, statusProgress, l.confirm.progress)
 				}
 				l.confirm = nil
+				l.layout()
 			}
 			return l, run
 		}
@@ -246,6 +232,7 @@ func (l listVolumesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					fmt.Sprintf("%s is used by %s. Delete those containers first.", v.Name, strings.Join(v.UsedBy, ", ")))
 			}
 			l.confirm = deleteVolumePrompt(l.dockerClient, *v)
+			l.layout()
 			return l, nil
 		case "P":
 			unused := 0
@@ -258,8 +245,11 @@ func (l listVolumesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return l, l.status.set(l.tickID, statusSuccess, "No unused volumes to delete")
 			}
 			l.confirm = pruneVolumesPrompt(l.dockerClient, unused)
+			l.layout()
 			return l, nil
 		}
+		l.grid.handleKey(msg)
+		return l, nil
 
 	case actionMsg:
 		var clear tea.Cmd
@@ -283,9 +273,7 @@ func (l listVolumesModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return l, tickCmd(l.tickID)
 	}
 
-	var cmd tea.Cmd
-	l.table, cmd = l.table.Update(msg)
-	return l, cmd
+	return l, nil
 }
 
 func (l listVolumesModel) View() string {
@@ -300,23 +288,7 @@ func (l listVolumesModel) View() string {
 	info := runningStyle.Render(glyphRunning) + " " + crumbStyle.Render(strconv.Itoa(inUse)) + mutedStyle.Render(" in use") +
 		"   " + mutedStyle.Render(glyphStopped+" ") + crumbStyle.Render(strconv.Itoa(len(l.all)-inUse)) + mutedStyle.Render(" unused")
 
-	title, lines := "", []detailLine(nil)
-	if v := l.selected(); v != nil {
-		usedBy := "No containers"
-		if len(v.UsedBy) > 0 {
-			usedBy = strings.Join(v.UsedBy, ", ")
-		}
-		title = v.Name
-		lines = []detailLine{
-			{"Mountpoint", v.Mountpoint},
-			{"Driver", v.Driver},
-			{"Used by", usedBy},
-		}
-		if p := v.Labels[composeStackIdentifier]; p != "" {
-			lines = append(lines, detailLine{"Project", p})
-		}
-	}
-	panel := renderPanel(width, title, detailsBody(width, lines), detailsLines)
+	panel := ""
 	if l.confirm != nil {
 		panel = renderConfirmPanel(width, l.confirm)
 	}
@@ -324,9 +296,13 @@ func (l listVolumesModel) View() string {
 	if l.listErr != "" {
 		status = statusLine{text: l.listErr, kind: statusError}.render()
 	}
-	return renderListPage(
+	empty := "No volumes. Compose and docker run -v create them."
+	if l.filter.query() != "" {
+		empty = "Nothing matches /" + l.filter.query() + ". Press esc to clear the filter."
+	}
+	return renderGridPage(
 		renderHeader(width, info, withFilterCrumb(l.filter, "Volumes")...),
-		tableBaseStyle.Render(l.table.View()),
+		l.grid.view(empty),
 		panel,
 		renderBottomBar(width, l.bottomLeft(), status),
 	)

@@ -216,16 +216,14 @@ stardocker/
     ├── input.go             # Text field and "/" filter
     ├── confirm.go           # Confirmation prompts and status messages
     ├── layout.go            # Palette and shared screen layout
-    ├── columns.go           # Fits table columns to the terminal width
-    ├── details.go           # Details panel for the selected row
-    ├── styles.go            # Table styles
+    ├── cards.go             # Card grid shared by the list screens
     └── help.go              # Keybindings and help
 ```
 
 ### Built with
 
 - [Bubble Tea](https://github.com/charmbracelet/bubbletea): the Elm-inspired TUI framework for Go
-- [Bubbles](https://github.com/charmbracelet/bubbles): tables, viewports, help and key bindings
+- [Bubbles](https://github.com/charmbracelet/bubbles): viewports, help and key bindings
 - [Lip Gloss](https://github.com/charmbracelet/lipgloss): terminal styling and layout
 - [Docker Go SDK](https://github.com/docker/go-sdk): Docker Engine API client
 

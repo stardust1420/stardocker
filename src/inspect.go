@@ -137,7 +137,7 @@ func renderInspect(info containerTypes.InspectResponse) string {
 		}
 		for _, l := range lines {
 			label := l[0] + strings.Repeat(" ", w-lipgloss.Width(l[0]))
-			b.WriteString("  " + detailLabelStyle.Render(label) + "   " + l[1] + "\n")
+			b.WriteString("  " + mutedStyle.Render(label) + "   " + l[1] + "\n")
 		}
 		b.WriteString("\n")
 	}

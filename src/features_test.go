@@ -73,24 +73,26 @@ func TestContainerFilterAndRunningOnly(t *testing.T) {
 	stack := composeStackSummary("shop", []Container{web, db})
 	solo := Container{Name: "redis", Type: TypeContainer, ID: "cccc", Image: "redis", State: containerTypes.StateExited}
 
-	l := listContainersModel{ShowChildrenSet: make(StringSet), filter: newFilterBar()}
+	l := listContainersModel{Collapsed: make(StringSet), filter: newFilterBar()}
+	l.Collapsed.Add("shop")
 	l.filter.field.value = "postgres"
-	rows, items := l.getRows(l.visible([]Container{stack, solo}))
-	// Matched through a service: the stack opens and shows only that service.
-	if len(rows) != 2 || items[0].Name != "shop" || items[1].Name != "shop-db" {
+	_, items := l.entries(l.visible([]Container{stack, solo}))
+	// Matched through a service: the collapsed stack opens and shows only
+	// that service.
+	if strings.Join(names(items), ",") != "shop,shop-db" {
 		t.Fatalf("filter postgres: %v", names(items))
 	}
 
 	l.filter.field.value = "shop"
-	_, items = l.getRows(l.visible([]Container{stack, solo}))
+	_, items = l.entries(l.visible([]Container{stack, solo}))
 	if len(items) != 1 { // stack name matches; stays collapsed
 		t.Errorf("filter shop: %v", names(items))
 	}
 
 	l.filter.field.value = ""
 	l.runningOnly = true
-	l.ShowChildrenSet.Add("shop")
-	_, items = l.getRows(l.visible([]Container{stack, solo}))
+	l.Collapsed.Remove("shop")
+	_, items = l.entries(l.visible([]Container{stack, solo}))
 	if strings.Join(names(items), ",") != "shop,shop-web" {
 		t.Errorf("running only: %v", names(items))
 	}

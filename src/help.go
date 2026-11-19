@@ -33,12 +33,12 @@ type keyMap struct {
 
 var keys = keyMap{
 	Up: key.NewBinding(
-		key.WithKeys("up", "k"),
-		key.WithHelp("↑/k", "move up"),
+		key.WithKeys("up", "down", "left", "right", "k", "j", "h", "l"),
+		key.WithHelp("←↑↓→/hjkl", "move"),
 	),
 	Down: key.NewBinding(
-		key.WithKeys("down", "j"),
-		key.WithHelp("↓/j", "move down"),
+		key.WithKeys("g", "G", "pgup", "pgdown"),
+		key.WithHelp("g/G pgup/pgdn", "first, last, page"),
 	),
 	Left: key.NewBinding(
 		key.WithKeys("esc"),
@@ -72,7 +72,7 @@ var (
 
 var containersKeys = containersKeyMap{
 	keyMap:  keys,
-	Open:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "logs / expand stack")),
+	Open:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "logs / fold stack")),
 	Toggle:  key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "start/stop")),
 	Restart: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "restart")),
 	Pause:   key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause/unpause")),

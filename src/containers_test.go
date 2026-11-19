@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	containerTypes "github.com/docker/docker/api/types/container"
 )
@@ -41,72 +40,39 @@ func TestComposeStackSummary(t *testing.T) {
 	}
 }
 
-func TestFitColumns(t *testing.T) {
-	specs := []colSpec{
-		{title: "A", min: 2, max: 2},
-		{title: "Name", min: 4, max: 30, shrinkOrder: 1, grow: 1},
-		{title: "Ports", min: 5, max: 40, shrinkOrder: 2, grow: 3},
-	}
-	rows := []table.Row{{"x", "a-very-long-container-name", "8080->80/tcp, 9090->90/tcp"}}
-
-	// Unknown width: natural widths.
-	cols := fitColumns(specs, rows, 0)
-	if cols[1].Width != 26 || cols[2].Width != 26 {
-		t.Fatalf("natural widths = %d, %d", cols[1].Width, cols[2].Width)
-	}
-
-	// Natural total = 2 (border) + (2+2) + (26+2) + (26+2) = 62.
-
-	// Narrow: Name (lower shrinkOrder) gives up width before Ports.
-	cols = fitColumns(specs, rows, 52)
-	if cols[1].Width != 16 || cols[2].Width != 26 {
-		t.Errorf("fitted widths = %d, %d; want 16, 26", cols[1].Width, cols[2].Width)
-	}
-
-	// Very narrow: everything at its minimum.
-	cols = fitColumns(specs, rows, 10)
-	if cols[1].Width != 4 || cols[2].Width != 5 {
-		t.Errorf("min widths = %d, %d; want 4, 5", cols[1].Width, cols[2].Width)
-	}
-
-	// Wide: 20 spare columns split 1:3 between Name and Ports, and the
-	// table comes out exactly as wide as asked.
-	cols = fitColumns(specs, rows, 82)
-	if cols[0].Width != 2 || cols[1].Width != 31 || cols[2].Width != 41 {
-		t.Errorf("grown widths = %d, %d, %d; want 2, 31, 41", cols[0].Width, cols[1].Width, cols[2].Width)
-	}
-	total := tableOverhead
-	for _, c := range cols {
-		total += c.Width + cellPadding
-	}
-	if total != 82 {
-		t.Errorf("table width = %d; want 82", total)
-	}
-}
-
-func TestGetRowsItemsAligned(t *testing.T) {
+func TestEntriesItemsAligned(t *testing.T) {
 	stack := composeStackSummary("shop", []Container{
 		{Name: "db", Type: TypeContainer, ID: "aaaaaaaaaaaaaaaa"},
 		{Name: "web", Type: TypeContainer, ID: "bbbbbbbbbbbbbbbb"},
 	})
 	solo := Container{Name: "solo", Type: TypeContainer, ID: "cccccccccccccccc"}
 
-	l := listContainersModel{ShowChildrenSet: make(StringSet)}
-	rows, items := l.getRows([]Container{stack, solo})
-	if len(rows) != 2 || len(items) != 2 || rows[0][1] != "▸ shop" {
-		t.Fatalf("collapsed: %d rows, %d items, name %q", len(rows), len(items), rows[0][1])
+	// Stacks start open: heading, its services, then the standalone section.
+	l := listContainersModel{Collapsed: make(StringSet)}
+	entries, items := l.entries([]Container{stack, solo})
+	if len(entries) != 5 || len(items) != 5 {
+		t.Fatalf("expanded: %d entries, %d items", len(entries), len(items))
+	}
+	if !entries[0].heading || !entries[0].selectable || entries[0].title != "▾ shop" {
+		t.Errorf("stack heading = %+v", entries[0])
+	}
+	if items[1].Name != "db" || items[2].Name != "web" || items[4].Name != "solo" {
+		t.Errorf("unexpected order: %v", names(items))
+	}
+	if !entries[3].heading || entries[3].selectable || entries[3].title != "Standalone" {
+		t.Errorf("standalone heading = %+v", entries[3])
 	}
 
-	l.ShowChildrenSet.Add("shop")
-	rows, items = l.getRows([]Container{stack, solo})
-	if len(rows) != 4 || len(items) != 4 {
-		t.Fatalf("expanded: %d rows, %d items", len(rows), len(items))
+	l.Collapsed.Add("shop")
+	entries, items = l.entries([]Container{stack, solo})
+	if len(entries) != 3 || len(items) != 3 || entries[0].title != "▸ shop" {
+		t.Fatalf("collapsed: %d entries, %d items, title %q", len(entries), len(items), entries[0].title)
 	}
-	if rows[0][1] != "▾ shop" || items[1].Name != "db" || items[2].Name != "web" || items[3].Name != "solo" {
-		t.Errorf("unexpected order: %q, %v", rows[0][1], items)
-	}
-	if rows[1][2] != "aaaaaaaaaaaa" {
-		t.Errorf("child ID cell = %q; want short ID without indent", rows[1][2])
+
+	// Without stacks there is no "Standalone" heading.
+	entries, _ = l.entries([]Container{solo})
+	if len(entries) != 1 || entries[0].heading {
+		t.Errorf("solo only: %+v", entries)
 	}
 }
 

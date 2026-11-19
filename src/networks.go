@@ -10,7 +10,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	containerTypes "github.com/docker/docker/api/types/container"
@@ -35,24 +34,15 @@ type Network struct {
 // builtinNetworks are created by Docker itself and can't be removed.
 var builtinNetworks = map[string]bool{"bridge": true, "host": true, "none": true}
 
-var networkColumns = []colSpec{
-	{title: " ", min: 1, max: 1},
-	{title: "Name", min: 12, max: 40, shrinkOrder: 3, grow: 3},
-	{title: "Network ID", min: 12, max: 12, shrinkOrder: 0},
-	{title: "Driver", min: 6, max: 10},
-	{title: "Subnet", min: 10, max: 36, shrinkOrder: 1, grow: 1},
-	{title: "Used by", min: 10, max: 60, shrinkOrder: 2, grow: 2},
-}
-
 type listNetworksModel struct {
 	help         help.Model
 	keys         listKeyMap
 	dockerClient client.SDKClient
 	width        int
 	height       int
-	table        table.Model
+	grid         gridView
 	all          []Network
-	items        []Network
+	items        []Network // items[i] is the network on grid card i
 	tickID       int
 	status       statusLine
 	listErr      string
@@ -61,22 +51,18 @@ type listNetworksModel struct {
 }
 
 func InitListNetworksModel(dockerClient client.SDKClient, width, height int) listNetworksModel {
-	t := table.New(
-		table.WithColumns(fitColumns(networkColumns, nil, pageWidth(width))),
-		table.WithFocused(true),
-		table.WithHeight(listTableHeight(height, 1)),
-	)
-	t.SetStyles(tableStyles())
-	return listNetworksModel{
+	l := listNetworksModel{
 		help:         newHelp(),
 		keys:         networksKeys,
 		dockerClient: dockerClient,
 		width:        width,
 		height:       height,
-		table:        t,
+		grid:         gridView{cursor: -1},
 		tickID:       newTickID(),
 		filter:       newFilterBar(),
 	}
+	l.layout()
+	return l
 }
 
 func (l listNetworksModel) Init() tea.Cmd {
@@ -146,14 +132,12 @@ func (l *listNetworksModel) refresh() {
 	l.rebuild()
 }
 
+// rebuild fills the grid with the networks that pass the filter. The grid
+// keeps the cursor on the same network (by ID).
 func (l *listNetworksModel) rebuild() {
-	prev := ""
-	if n := l.selected(); n != nil {
-		prev = n.ID
-	}
 	q := l.filter.query()
 	var items []Network
-	var rows []table.Row
+	var entries []gridEntry
 	for _, n := range l.all {
 		subnet := strings.Join(n.Subnets, ", ")
 		if !matches(q, n.Name, n.ID, n.Driver, subnet, strings.Join(n.UsedBy, " ")) {
@@ -163,25 +147,33 @@ func (l *listNetworksModel) rebuild() {
 		if len(n.UsedBy) > 0 {
 			glyph = glyphRunning
 		}
-		rows = append(rows, table.Row{glyph, n.Name, shortContainerID(n.ID), n.Driver, subnet, strings.Join(n.UsedBy, ", ")})
+		body := []string{valueLabel(n.Driver, "driver")}
+		if subnet != "" {
+			body = append(body, textLine(subnet))
+		}
+		id := shortContainerID(n.ID)
+		switch {
+		case builtinNetworks[n.Name]:
+			id += "   built in"
+		case n.Internal:
+			id += "   internal"
+		}
+		entries = append(entries, gridEntry{
+			key:        n.ID,
+			selectable: true,
+			glyph:      glyphFor(glyph),
+			title:      n.Name,
+			body:       append(body, mutedStyle.Render(id), usedByLine(n.UsedBy, "No containers attached")),
+		})
 		items = append(items, n)
 	}
 	l.items = items
-	l.table.SetRows(rows)
-	cursor := min(l.table.Cursor(), max(0, len(rows)-1))
-	for i, n := range items {
-		if prev != "" && n.ID == prev {
-			cursor = i
-			break
-		}
-	}
-	l.table.SetCursor(cursor)
 	l.layout()
+	l.grid.setEntries(entries)
 }
 
 func (l *listNetworksModel) layout() {
-	l.table.SetHeight(listTableHeight(l.height, lipgloss.Height(l.bottomLeft())))
-	l.table.SetColumns(fitColumns(networkColumns, l.table.Rows(), pageWidth(l.width)))
+	l.grid.resize(pageWidth(l.width), listGridHeight(l.height, lipgloss.Height(l.bottomLeft()), l.confirm != nil))
 }
 
 func (l listNetworksModel) bottomLeft() string {
@@ -192,7 +184,7 @@ func (l listNetworksModel) bottomLeft() string {
 }
 
 func (l listNetworksModel) selected() *Network {
-	i := l.table.Cursor()
+	i := l.grid.cursor
 	if i < 0 || i >= len(l.items) {
 		return nil
 	}
@@ -222,6 +214,7 @@ func (l listNetworksModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					l.status.set(l.tickID, statusProgress, l.confirm.progress)
 				}
 				l.confirm = nil
+				l.layout()
 			}
 			return l, run
 		}
@@ -265,6 +258,7 @@ func (l listNetworksModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					fmt.Sprintf("%s is used by %s. Delete or disconnect those containers first.", n.Name, strings.Join(n.UsedBy, ", ")))
 			}
 			l.confirm = deleteNetworkPrompt(l.dockerClient, *n)
+			l.layout()
 			return l, nil
 		case "P":
 			unused := 0
@@ -277,8 +271,11 @@ func (l listNetworksModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return l, l.status.set(l.tickID, statusSuccess, "No unused networks to delete")
 			}
 			l.confirm = pruneNetworksPrompt(l.dockerClient, unused)
+			l.layout()
 			return l, nil
 		}
+		l.grid.handleKey(msg)
+		return l, nil
 
 	case actionMsg:
 		var clear tea.Cmd
@@ -302,9 +299,7 @@ func (l listNetworksModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return l, tickCmd(l.tickID)
 	}
 
-	var cmd tea.Cmd
-	l.table, cmd = l.table.Update(msg)
-	return l, cmd
+	return l, nil
 }
 
 func (l listNetworksModel) View() string {
@@ -316,34 +311,7 @@ func (l listNetworksModel) View() string {
 	}
 	info := crumbStyle.Render(strconv.Itoa(len(l.all))) + mutedStyle.Render(" "+noun)
 
-	title, lines := "", []detailLine(nil)
-	if n := l.selected(); n != nil {
-		usedBy := "No containers"
-		if len(n.UsedBy) > 0 {
-			usedBy = strings.Join(n.UsedBy, ", ")
-		}
-		subnet := strings.Join(n.Subnets, ", ")
-		if subnet == "" {
-			subnet = "None"
-		}
-		kind := n.Driver + ", " + n.Scope + " scope"
-		if n.Internal {
-			kind += ", internal (no outside access)"
-		}
-		if builtinNetworks[n.Name] {
-			kind += ", built in"
-		}
-		title = n.Name + "  " + shortContainerID(n.ID)
-		lines = []detailLine{
-			{"Driver", kind},
-			{"Subnet", subnet},
-			{"Used by", usedBy},
-		}
-		if p := n.Labels[composeStackIdentifier]; p != "" {
-			lines = append(lines, detailLine{"Project", p})
-		}
-	}
-	panel := renderPanel(width, title, detailsBody(width, lines), detailsLines)
+	panel := ""
 	if l.confirm != nil {
 		panel = renderConfirmPanel(width, l.confirm)
 	}
@@ -351,9 +319,13 @@ func (l listNetworksModel) View() string {
 	if l.listErr != "" {
 		status = statusLine{text: l.listErr, kind: statusError}.render()
 	}
-	return renderListPage(
+	empty := "No networks."
+	if l.filter.query() != "" {
+		empty = "Nothing matches /" + l.filter.query() + ". Press esc to clear the filter."
+	}
+	return renderGridPage(
 		renderHeader(width, info, withFilterCrumb(l.filter, "Networks")...),
-		tableBaseStyle.Render(l.table.View()),
+		l.grid.view(empty),
 		panel,
 		renderBottomBar(width, l.bottomLeft(), status),
 	)

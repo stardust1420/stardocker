@@ -10,7 +10,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	containerTypes "github.com/docker/docker/api/types/container"
@@ -41,24 +40,24 @@ type containerActionMsg struct {
 // List Containers Model
 
 type listContainersModel struct {
-	help            help.Model
-	keys            containersKeyMap
-	dockerClient    client.SDKClient
-	width           int
-	height          int
-	table           table.Model
-	all             []Container // the latest fetch, before filtering and sorting
-	items           []Container // items[i] is the container or stack shown in table row i
-	ShowChildrenSet StringSet
-	tickID          int
-	status          statusLine
-	listErr         string         // set while listing containers fails
-	confirm         *confirmPrompt // pending delete or prune, if any
-	running         int            // header counts, across stacks and standalone containers
-	stopped         int
-	filter          filterBar
-	sortBy          int  // index into containerSorts
-	runningOnly     bool // "a" hides containers that aren't running
+	help         help.Model
+	keys         containersKeyMap
+	dockerClient client.SDKClient
+	width        int
+	height       int
+	grid         gridView
+	all          []Container // the latest fetch, before filtering and sorting
+	items        []Container // items[i] is what grid entry i shows (zero for a plain heading)
+	Collapsed    StringSet   // stacks whose services are hidden
+	tickID       int
+	status       statusLine
+	listErr      string         // set while listing containers fails
+	confirm      *confirmPrompt // pending delete or prune, if any
+	running      int            // header counts, across stacks and standalone containers
+	stopped      int
+	filter       filterBar
+	sortBy       int  // index into containerSorts
+	runningOnly  bool // "a" hides containers that aren't running
 	// stats are the CPU and memory figures by container ID; samples are the
 	// raw readings they were computed from, kept for the next CPU delta.
 	stats         map[string]containerStats
@@ -88,20 +87,6 @@ type Container struct {
 	Children []Container
 }
 
-// containerColumns: Ports gives up width last so published ports stay
-// readable; the details panel below the table always shows them in full.
-var containerColumns = []colSpec{
-	{title: " ", min: 1, max: 1},
-	{title: "Name", min: 12, max: 40, shrinkOrder: 4, grow: 3},
-	{title: "Container ID", min: 12, max: 12, shrinkOrder: 1},
-	{title: "Image", min: 10, max: 35, shrinkOrder: 3, grow: 2},
-	{title: "Ports", min: 12, max: 70, shrinkOrder: 5, grow: 3},
-	{title: "CPU", min: 6, max: 7},
-	{title: "Memory", min: 7, max: 9},
-	{title: "Status", min: 10, max: 28, shrinkOrder: 2, grow: 1},
-	{title: "State", min: 7, max: 10, shrinkOrder: 0},
-}
-
 // containerSorts are the orders "o" cycles through.
 var containerSorts = []struct {
 	label string
@@ -114,25 +99,19 @@ var containerSorts = []struct {
 }
 
 func InitListContainersModel(dockerClient client.SDKClient, width int, height int) listContainersModel {
-	t := table.New(
-		table.WithColumns(fitColumns(containerColumns, nil, pageWidth(width))),
-		table.WithFocused(true),
-		table.WithHeight(listTableHeight(height, 1)),
-	)
-
-	t.SetStyles(tableStyles())
-
-	return listContainersModel{
-		help:            newHelp(),
-		keys:            containersKeys,
-		dockerClient:    dockerClient,
-		width:           width,
-		height:          height,
-		table:           t,
-		ShowChildrenSet: make(StringSet),
-		tickID:          newTickID(),
-		filter:          newFilterBar(),
+	l := listContainersModel{
+		help:         newHelp(),
+		keys:         containersKeys,
+		dockerClient: dockerClient,
+		width:        width,
+		height:       height,
+		grid:         gridView{cursor: -1},
+		Collapsed:    make(StringSet),
+		tickID:       newTickID(),
+		filter:       newFilterBar(),
 	}
+	l.layout()
+	return l
 }
 
 func (l listContainersModel) Init() tea.Cmd {
@@ -172,27 +151,14 @@ func (l *listContainersModel) refresh() {
 	l.rebuild()
 }
 
-// rebuild fills the table from the last fetch with the current filter and
-// sort, keeping the cursor on the same container or stack (not the same
-// row number) so rows appearing or disappearing above it don't move it.
+// rebuild fills the grid from the last fetch with the current filter and
+// sort. The grid keeps the cursor on the same container or stack (by
+// itemKey), not the same position, so cards coming and going don't move it.
 func (l *listContainersModel) rebuild() {
-	prev := ""
-	if c := l.selected(); c != nil {
-		prev = itemKey(*c)
-	}
-
-	rows, items := l.getRows(l.visible(l.all))
+	entries, items := l.entries(l.visible(l.all))
 	l.items = items
-	l.table.SetRows(rows)
-	cursor := min(l.table.Cursor(), max(0, len(rows)-1)) // SetRows doesn't clamp
-	for i, it := range items {
-		if prev != "" && itemKey(it) == prev {
-			cursor = i
-			break
-		}
-	}
-	l.table.SetCursor(cursor)
 	l.layout()
+	l.grid.setEntries(entries)
 }
 
 // itemKey identifies a row's container or stack across refreshes.
@@ -217,11 +183,10 @@ func (l listContainersModel) resume(width, height int) listContainersModel {
 	return l
 }
 
-// layout fits the table to the window: full page width, and whatever height
-// is left after the header, details panel and help.
+// layout fits the grid to the window: full page width, and whatever height
+// is left after the header, the help and any confirmation.
 func (l *listContainersModel) layout() {
-	l.table.SetHeight(listTableHeight(l.height, lipgloss.Height(l.bottomLeft())))
-	l.table.SetColumns(fitColumns(containerColumns, l.table.Rows(), pageWidth(l.width)))
+	l.grid.resize(pageWidth(l.width), listGridHeight(l.height, lipgloss.Height(l.bottomLeft()), l.confirm != nil))
 }
 
 // bottomLeft is the help, or the filter field while it is being edited.
@@ -232,11 +197,11 @@ func (l listContainersModel) bottomLeft() string {
 	return l.help.View(l.keys)
 }
 
-// selected returns the container or stack under the cursor, or nil when the
-// table is empty.
+// selected returns the container or stack under the cursor, or nil when
+// there is none.
 func (l listContainersModel) selected() *Container {
-	i := l.table.Cursor()
-	if i < 0 || i >= len(l.items) {
+	i := l.grid.cursor
+	if i < 0 || i >= len(l.items) || !l.grid.entries[i].selectable {
 		return nil
 	}
 	return &l.items[i]
@@ -271,10 +236,10 @@ func (l listContainersModel) visibleChildren(stack Container) []Container {
 	return out
 }
 
-// expanded reports whether a stack's services are listed under it: the
-// user opened it, or the filter matched services inside it.
+// expanded reports whether a stack's services are shown under it: unless
+// the user collapsed it, or always when the filter matched services inside.
 func (l listContainersModel) expanded(stack Container) bool {
-	if l.ShowChildrenSet.Contains(stack.Name) {
+	if !l.Collapsed.Contains(stack.Name) {
 		return true
 	}
 	q := l.filter.query()
@@ -377,8 +342,6 @@ func runningIDs(all []Container) []string {
 }
 
 func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
@@ -399,6 +362,7 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					l.status.set(l.tickID, statusProgress, l.confirm.progress)
 				}
 				l.confirm = nil
+				l.layout()
 			}
 			return l, run
 		}
@@ -447,6 +411,7 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "d":
 			if c := l.selected(); c != nil {
 				l.confirm = deleteContainerPrompt(l.dockerClient, *c)
+				l.layout()
 			}
 			return l, nil
 
@@ -456,6 +421,7 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return l, l.status.set(l.tickID, statusSuccess, refusal)
 			}
 			l.confirm = prompt
+			l.layout()
 			return l, nil
 
 		case "enter":
@@ -473,10 +439,10 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return lm, lm.Init()
 
 			case TypeComposeStack:
-				if l.ShowChildrenSet.Contains(c.Name) {
-					l.ShowChildrenSet.Remove(c.Name)
+				if l.Collapsed.Contains(c.Name) {
+					l.Collapsed.Remove(c.Name)
 				} else {
-					l.ShowChildrenSet.Add(c.Name)
+					l.Collapsed.Add(c.Name)
 				}
 				l.rebuild()
 			}
@@ -530,6 +496,9 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return l, containerPlanCmd(l.dockerClient, plan)
 		}
 
+		l.grid.handleKey(msg)
+		return l, nil
+
 	case containerActionMsg:
 		var clear tea.Cmd
 		if msg.err != nil {
@@ -571,16 +540,13 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return l, tea.Batch(cmds...)
 	}
 
-	l.table, cmd = l.table.Update(msg)
-
-	return l, cmd
+	return l, nil
 }
 
 func (l listContainersModel) View() string {
 	width := pageWidth(l.width)
-	title, lines := l.details()
 
-	panel := renderPanel(width, title, detailsBody(width, lines), detailsLines)
+	panel := ""
 	if l.confirm != nil {
 		panel = renderConfirmPanel(width, l.confirm)
 	}
@@ -602,52 +568,33 @@ func (l listContainersModel) View() string {
 		info = mutedStyle.Render(strings.Join(mode, ", ")+"   ") + info
 	}
 
-	return renderListPage(
+	return renderGridPage(
 		renderHeader(width, info, withFilterCrumb(l.filter, "Containers")...),
-		tableBaseStyle.Render(l.table.View()),
+		l.grid.view(l.emptyText()),
 		panel,
 		renderBottomBar(width, l.bottomLeft(), status),
 	)
 }
 
-// details describes the selected row in full, so nothing is lost when table
-// columns are truncated. It returns the panel title and its lines.
-func (l listContainersModel) details() (string, []detailLine) {
-	c := l.selected()
-	if c == nil {
-		return "", nil
+// emptyText is what the grid says when there is nothing to show.
+func (l listContainersModel) emptyText() string {
+	switch {
+	case l.listErr != "" && len(l.all) == 0:
+		return "Can't reach Docker. The error is at the bottom right."
+	case l.filter.query() != "":
+		return "Nothing matches /" + l.filter.query() + ". Press esc to clear the filter."
+	case l.runningOnly && len(l.all) > 0:
+		return "Nothing is running. Press a to show stopped containers too."
 	}
+	return "No containers yet. Create one with docker run or docker compose up."
+}
 
-	ports := formatPorts(c.Ports)
-	if ports == "" {
-		ports = "None published"
-		if c.State != containerTypes.StateRunning {
-			ports = "None while stopped (Docker reports ports for running containers only)"
-		}
-	}
-
-	if c.Type == TypeComposeStack {
-		running := 0
-		services := make([]string, len(c.Children))
-		for i, child := range c.Children {
-			services[i] = stateGlyph(child.State) + " " + child.Name
-			if child.State == containerTypes.StateRunning {
-				running++
-			}
-		}
-		return c.Name + "  compose stack", []detailLine{
-			{"Status", fmt.Sprintf("%d of %d services running", running, len(c.Children))},
-			{"Ports", ports},
-			{"Services", strings.Join(services, "   ")},
-		}
-	}
-
-	return c.Name + "  " + shortContainerID(c.ID), []detailLine{
-		{"Image", c.Image},
-		{"Status", fmt.Sprintf("%s, created %s ago", c.Status, humanDuration(time.Since(c.Created)))},
-		{"Ports", ports},
-		{"Command", c.Command},
-	}
+// shortStatus tightens Docker's status wording so it fits a card:
+// "Exited (0) About a minute ago" becomes "Exited (0) 1 minute ago".
+func shortStatus(s string) string {
+	s = strings.Replace(s, "About a minute", "1 minute", 1)
+	s = strings.Replace(s, "About an hour", "1 hour", 1)
+	return strings.Replace(s, "Less than a second", "1 second", 1)
 }
 
 func containerDisplayName(names []string, id string) string {
@@ -798,55 +745,106 @@ func stateGlyph(state string) string {
 	}
 }
 
-// getRows returns the table rows and, in the same order, the container or
-// stack each row shows. Actions read from the latter, never from the cells.
-func (l listContainersModel) getRows(containers []Container) ([]table.Row, []Container) {
-	rows := []table.Row{}
-	items := []Container{}
+// entries returns the grid entries and, in the same order, the container
+// or stack each one shows (a zero Container for a plain heading). Actions
+// read from the latter. Stacks come first, each a selectable heading over
+// its services' cards; standalone containers follow under their own heading.
+func (l *listContainersModel) entries(containers []Container) ([]gridEntry, []Container) {
+	var entries []gridEntry
+	var items []Container
+	var standalone []Container
 
-	row := func(c Container, name string) table.Row {
-		s, ok := l.statsOf(c)
-		return table.Row{
-			stateGlyph(c.State),
-			name,
-			shortContainerID(c.ID),
-			c.Image,
-			formatPorts(c.Ports),
-			formatCPU(s, ok),
-			formatMem(s, ok),
-			c.Status,
-			c.State,
+	for _, c := range containers {
+		if c.Type != TypeComposeStack {
+			standalone = append(standalone, c)
+			continue
 		}
-	}
-
-	for _, container := range containers {
-		name := container.Name
-		open := container.Type == TypeComposeStack && l.expanded(container)
-		if container.Type == TypeComposeStack {
-			if open {
-				name = "▾ " + name
-			} else {
-				name = "▸ " + name
-			}
-		}
-
-		rows = append(rows, row(container, name))
-		items = append(items, container)
-
+		open := l.expanded(c)
+		marker := "▸ "
 		if open {
-			children := l.visibleChildren(container)
-			for i, child := range children {
-				branch := "├ "
-				if i == len(children)-1 {
-					branch = "└ "
-				}
-				rows = append(rows, row(child, "  "+branch+child.Name))
+			marker = "▾ "
+		}
+		entries = append(entries, gridEntry{
+			key:        itemKey(c),
+			heading:    true,
+			selectable: true,
+			glyph:      glyphFor(stateGlyph(c.State)),
+			title:      marker + c.Name,
+			meta:       l.stackMeta(c),
+		})
+		items = append(items, c)
+		if open {
+			for _, child := range l.visibleChildren(c) {
+				entries = append(entries, l.containerCard(child))
 				items = append(items, child)
 			}
 		}
 	}
 
-	return rows, items
+	if len(standalone) > 0 && len(entries) > 0 {
+		entries = append(entries, gridEntry{key: "heading:standalone", heading: true, title: "Standalone"})
+		items = append(items, Container{})
+	}
+	for _, c := range standalone {
+		entries = append(entries, l.containerCard(c))
+		items = append(items, c)
+	}
+	return entries, items
+}
+
+// stackMeta is the summary after a stack's name: services running, the
+// stack's total CPU and memory.
+func (l *listContainersModel) stackMeta(c Container) string {
+	running := 0
+	for _, child := range c.Children {
+		if child.State == containerTypes.StateRunning {
+			running++
+		}
+	}
+	parts := []string{valueLabel(fmt.Sprintf("%d of %d", running, len(c.Children)), "running")}
+	s, ok := l.statsOf(c)
+	if cpu := formatCPU(s, ok); cpu != "" {
+		parts = append(parts, valueLabel(cpu, "CPU"))
+	}
+	if mem := formatMem(s, ok); mem != "" {
+		parts = append(parts, valueLabel(mem, "memory"))
+	}
+	return strings.Join(parts, "   ")
+}
+
+// containerCard shows a container: image, published ports, live CPU and
+// memory, then its status. A stopped container has no ports or stats, so
+// it shows just its image and status.
+func (l *listContainersModel) containerCard(c Container) gridEntry {
+	body := []string{textLine(c.Image)}
+
+	if ports := strings.ReplaceAll(formatPorts(c.Ports), "->", "→"); ports != "" {
+		body = append(body, textLine(ports))
+	} else if c.State == containerTypes.StateRunning {
+		body = append(body, mutedStyle.Render("No published ports"))
+	}
+
+	var stats []string
+	s, ok := l.statsOf(c)
+	if cpu := formatCPU(s, ok); cpu != "" {
+		stats = append(stats, valueLabel(cpu, "CPU"))
+	}
+	if mem := formatMem(s, ok); mem != "" {
+		stats = append(stats, valueLabel(mem, "memory"))
+	}
+	if len(stats) > 0 {
+		body = append(body, strings.Join(stats, "   "))
+	}
+
+	body = append(body, mutedStyle.Render(shortStatus(c.Status)))
+
+	return gridEntry{
+		key:        itemKey(c),
+		selectable: true,
+		glyph:      glyphFor(stateGlyph(c.State)),
+		title:      c.Name,
+		body:       body,
+	}
 }
 
 // deleteContainerPrompt builds the confirmation for deleting a container,

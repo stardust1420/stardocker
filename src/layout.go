@@ -8,24 +8,25 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// Shared layout for the list screens (containers, images):
+// Shared layout for the list screens (containers, images, volumes,
+// networks):
 //
 //	★ StarDocker › Containers                       ● 3 running  ○ 1 stopped
 //
-//	┌ table, full width, fills the remaining height ─────────────────────────┐
-//	└────────────────────────────────────────────────────────────────────────┘
-//	╭─ selected-item-name ───────────────────────────────────────────────────╮
-//	│ Label     value                                                        │
+//	grid of cards (cards.go), full width, fills the remaining height
+//
+//	╭─ Delete web? ──────────────────────────────────────────────────────────╮
+//	│ the red confirmation panel, only while a delete or prune is pending   │
 //	╰────────────────────────────────────────────────────────────────────────╯
 //	  help keys                                               status message
 //
-// Every block spans the window minus pageMargin on each side, and all text
-// starts at the same column: pageMargin + textIndent (border + 1 padding).
+// Every block spans the window minus pageMargin on each side, and text
+// starts at pageMargin + textIndent.
 
 const (
 	pageMargin   = 1
 	textIndent   = 2
-	detailsLines = 4 // content lines inside the details panel
+	detailsLines = 4 // content lines inside the confirmation panel
 )
 
 // Palette. Orange is the brand and focus colour; steel blue marks the
@@ -65,13 +66,6 @@ func pageWidth(windowWidth int) int {
 	return max(20, windowWidth-2*pageMargin)
 }
 
-// listTableHeight is the height to give the bubbles table (its header row
-// included) so the screen fills windowHeight exactly.
-func listTableHeight(windowHeight, helpLines int) int {
-	const header, gap, tableBorder, panel = 1, 1, 2, detailsLines + 2
-	return max(4, windowHeight-(header+gap+tableBorder+panel+helpLines))
-}
-
 // renderHeader draws "★ StarDocker › crumb › crumb" on the left and info on
 // the right, spanning width.
 func renderHeader(width int, info string, crumbs ...string) string {
@@ -99,15 +93,9 @@ func stateCounts(running, stopped int) string {
 		"   " + mutedStyle.Render(glyphStopped+" ") + crumbStyle.Render(strconv.Itoa(stopped)) + mutedStyle.Render(" stopped")
 }
 
-// renderPanel draws a rounded box spanning width with the title set into
-// its top border, and a fixed number of content lines so the layout doesn't
-// jump as the selection moves.
-func renderPanel(width int, title, body string, lines int) string {
-	return renderPanelColored(width, title, body, lines, colorBorder, crumbStyle)
-}
-
-// renderPanelColored is renderPanel with a custom border colour and title
-// style (the delete confirmation uses red).
+// renderPanelColored draws a rounded box spanning width with the title set
+// into its top border, in the given border colour and title style (the
+// delete confirmation uses red), with a fixed number of content lines.
 func renderPanelColored(width int, title, body string, lines int, border lipgloss.Color, titleStyle lipgloss.Style) string {
 	edge := lipgloss.NewStyle().Foreground(border)
 	style := lipgloss.NewStyle().
@@ -150,17 +138,6 @@ func renderBottomBar(width int, helpView, st string) string {
 		gap = max(2, width-lipgloss.Width(help)-lipgloss.Width(st)-textIndent)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, help, strings.Repeat(" ", gap), st)
-}
-
-// renderListPage stacks the blocks of a list screen with consistent margins.
-func renderListPage(header, table, panel, bottom string) string {
-	return lipgloss.JoinVertical(lipgloss.Left,
-		pageStyle.Render(header),
-		"",
-		pageStyle.Render(table),
-		pageStyle.Render(panel),
-		pageStyle.Render(bottom),
-	)
 }
 
 // ansiTruncate shortens a styled string to w cells, keeping its styling.
