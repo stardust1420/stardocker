@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,14 +47,23 @@ type listContainersModel struct {
 	width           int
 	height          int
 	table           table.Model
+	all             []Container // the latest fetch, before filtering and sorting
 	items           []Container // items[i] is the container or stack shown in table row i
 	ShowChildrenSet StringSet
 	tickID          int
 	status          statusLine
 	listErr         string         // set while listing containers fails
-	confirm         *confirmPrompt // pending delete, if any
+	confirm         *confirmPrompt // pending delete or prune, if any
 	running         int            // header counts, across stacks and standalone containers
 	stopped         int
+	filter          filterBar
+	sortBy          int  // index into containerSorts
+	runningOnly     bool // "a" hides containers that aren't running
+	// stats are the CPU and memory figures by container ID; samples are the
+	// raw readings they were computed from, kept for the next CPU delta.
+	stats         map[string]containerStats
+	samples       map[string]cpuSample
+	statsInFlight bool
 }
 
 const composeStackIdentifier = "com.docker.compose.project"
@@ -84,12 +92,25 @@ type Container struct {
 // readable; the details panel below the table always shows them in full.
 var containerColumns = []colSpec{
 	{title: " ", min: 1, max: 1},
-	{title: "Name", min: 12, max: 40, shrinkOrder: 3, grow: 3},
-	{title: "Container ID", min: 12, max: 12},
-	{title: "Image", min: 10, max: 35, shrinkOrder: 2, grow: 2},
-	{title: "Ports", min: 12, max: 70, shrinkOrder: 4, grow: 3},
-	{title: "Status", min: 10, max: 28, shrinkOrder: 1, grow: 1},
+	{title: "Name", min: 12, max: 40, shrinkOrder: 4, grow: 3},
+	{title: "Container ID", min: 12, max: 12, shrinkOrder: 1},
+	{title: "Image", min: 10, max: 35, shrinkOrder: 3, grow: 2},
+	{title: "Ports", min: 12, max: 70, shrinkOrder: 5, grow: 3},
+	{title: "CPU", min: 6, max: 7},
+	{title: "Memory", min: 7, max: 9},
+	{title: "Status", min: 10, max: 28, shrinkOrder: 2, grow: 1},
 	{title: "State", min: 7, max: 10, shrinkOrder: 0},
+}
+
+// containerSorts are the orders "o" cycles through.
+var containerSorts = []struct {
+	label string
+	less  func(l *listContainersModel, a, b Container) bool
+}{
+	{"name", func(_ *listContainersModel, a, b Container) bool { return a.Name < b.Name }},
+	{"CPU", func(l *listContainersModel, a, b Container) bool { return l.cpuOf(a) > l.cpuOf(b) }},
+	{"memory", func(l *listContainersModel, a, b Container) bool { return l.memOf(a) > l.memOf(b) }},
+	{"newest", func(_ *listContainersModel, a, b Container) bool { return createdOf(a).After(createdOf(b)) }},
 }
 
 func InitListContainersModel(dockerClient client.SDKClient, width int, height int) listContainersModel {
@@ -110,6 +131,7 @@ func InitListContainersModel(dockerClient client.SDKClient, width int, height in
 		table:           t,
 		ShowChildrenSet: make(StringSet),
 		tickID:          newTickID(),
+		filter:          newFilterBar(),
 	}
 }
 
@@ -123,6 +145,7 @@ func (l listContainersModel) Init() tea.Cmd {
 	)
 }
 
+// refresh fetches the containers and rebuilds the table.
 func (l *listContainersModel) refresh() {
 	allContainers, err := FetchContainers(l.dockerClient)
 	if err != nil {
@@ -130,24 +153,7 @@ func (l *listContainersModel) refresh() {
 		return
 	}
 	l.listErr = ""
-	// Keep the cursor on the same container or stack, not the same row
-	// number, so rows appearing or disappearing above it don't move it.
-	prev := ""
-	if c := l.selected(); c != nil {
-		prev = itemKey(*c)
-	}
-
-	rows, items := l.getRows(allContainers)
-	l.items = items
-	l.table.SetRows(rows)
-	cursor := min(l.table.Cursor(), max(0, len(rows)-1)) // SetRows doesn't clamp
-	for i, it := range items {
-		if prev != "" && itemKey(it) == prev {
-			cursor = i
-			break
-		}
-	}
-	l.table.SetCursor(cursor)
+	l.all = allContainers
 
 	l.running, l.stopped = 0, 0
 	for _, c := range allContainers {
@@ -163,6 +169,29 @@ func (l *listContainersModel) refresh() {
 		}
 	}
 
+	l.rebuild()
+}
+
+// rebuild fills the table from the last fetch with the current filter and
+// sort, keeping the cursor on the same container or stack (not the same
+// row number) so rows appearing or disappearing above it don't move it.
+func (l *listContainersModel) rebuild() {
+	prev := ""
+	if c := l.selected(); c != nil {
+		prev = itemKey(*c)
+	}
+
+	rows, items := l.getRows(l.visible(l.all))
+	l.items = items
+	l.table.SetRows(rows)
+	cursor := min(l.table.Cursor(), max(0, len(rows)-1)) // SetRows doesn't clamp
+	for i, it := range items {
+		if prev != "" && itemKey(it) == prev {
+			cursor = i
+			break
+		}
+	}
+	l.table.SetCursor(cursor)
 	l.layout()
 }
 
@@ -175,13 +204,15 @@ func itemKey(c Container) string {
 }
 
 // resume prepares a containers screen that is being returned to (from the
-// logs view) with its cursor and expanded stacks intact. It gets a new tick
-// id so a tick left over from before can't start a second refresh loop, and
-// the current window size in case the terminal was resized meanwhile.
+// logs or inspect view) with its cursor and expanded stacks intact. It gets
+// a new tick id so a tick left over from before can't start a second
+// refresh loop, and the current window size in case the terminal was
+// resized meanwhile.
 func (l listContainersModel) resume(width, height int) listContainersModel {
 	l.width, l.height = width, height
 	l.tickID = newTickID()
 	l.confirm = nil
+	l.statsInFlight = false // a fetch from before belongs to the old tick id
 	l.layout()
 	return l
 }
@@ -189,8 +220,16 @@ func (l listContainersModel) resume(width, height int) listContainersModel {
 // layout fits the table to the window: full page width, and whatever height
 // is left after the header, details panel and help.
 func (l *listContainersModel) layout() {
-	l.table.SetHeight(listTableHeight(l.height, lipgloss.Height(l.help.View(l.keys))))
+	l.table.SetHeight(listTableHeight(l.height, lipgloss.Height(l.bottomLeft())))
 	l.table.SetColumns(fitColumns(containerColumns, l.table.Rows(), pageWidth(l.width)))
+}
+
+// bottomLeft is the help, or the filter field while it is being edited.
+func (l listContainersModel) bottomLeft() string {
+	if l.filter.editing {
+		return l.filter.prompt()
+	}
+	return l.help.View(l.keys)
 }
 
 // selected returns the container or stack under the cursor, or nil when the
@@ -201,6 +240,140 @@ func (l listContainersModel) selected() *Container {
 		return nil
 	}
 	return &l.items[i]
+}
+
+// passes reports whether a single container survives the running-only
+// toggle and the filter.
+func (l listContainersModel) passes(c Container, q string) bool {
+	if l.runningOnly && c.State != containerTypes.StateRunning {
+		return false
+	}
+	return matches(q, c.Name, c.Image, c.ID, c.Status, formatPorts(c.Ports))
+}
+
+// visibleChildren are the services of a stack to list under it: all of
+// them if the stack's own name matches the filter, otherwise the ones that
+// match. The running-only toggle applies either way.
+func (l listContainersModel) visibleChildren(stack Container) []Container {
+	q := l.filter.query()
+	nameMatches := matches(q, stack.Name)
+	var out []Container
+	for _, c := range stack.Children {
+		if nameMatches {
+			if !l.runningOnly || c.State == containerTypes.StateRunning {
+				out = append(out, c)
+			}
+		} else if l.passes(c, q) {
+			out = append(out, c)
+		}
+	}
+	l.sortContainers(out)
+	return out
+}
+
+// expanded reports whether a stack's services are listed under it: the
+// user opened it, or the filter matched services inside it.
+func (l listContainersModel) expanded(stack Container) bool {
+	if l.ShowChildrenSet.Contains(stack.Name) {
+		return true
+	}
+	q := l.filter.query()
+	return q != "" && !matches(q, stack.Name)
+}
+
+// visible applies the filter, running-only toggle and sort to the top-level
+// rows. A stack stays if any of its services does.
+func (l listContainersModel) visible(all []Container) []Container {
+	q := l.filter.query()
+	out := make([]Container, 0, len(all))
+	for _, c := range all {
+		if c.Type == TypeComposeStack {
+			if len(l.visibleChildren(c)) > 0 {
+				out = append(out, c)
+			}
+			continue
+		}
+		if l.passes(c, q) {
+			out = append(out, c)
+		}
+	}
+	l.sortContainers(out)
+	return out
+}
+
+func (l listContainersModel) sortContainers(cs []Container) {
+	if l.sortBy <= 0 || l.sortBy >= len(containerSorts) {
+		sort.SliceStable(cs, func(i, j int) bool { return cs[i].Name < cs[j].Name })
+		return
+	}
+	less := containerSorts[l.sortBy].less
+	sort.SliceStable(cs, func(i, j int) bool {
+		a, b := cs[i], cs[j]
+		if less(&l, a, b) {
+			return true
+		}
+		if less(&l, b, a) {
+			return false
+		}
+		return a.Name < b.Name
+	})
+}
+
+// statsOf is the CPU and memory of a container, or the sum over a stack's
+// services. ok is false when nothing is known.
+func (l *listContainersModel) statsOf(c Container) (containerStats, bool) {
+	if c.Type != TypeComposeStack {
+		s, ok := l.stats[c.ID]
+		return s, ok
+	}
+	var sum containerStats
+	found := false
+	for _, child := range c.Children {
+		if s, ok := l.stats[child.ID]; ok {
+			found = true
+			sum.mem += s.mem
+			sum.memLimit = max(sum.memLimit, s.memLimit)
+			if s.hasCPU {
+				sum.cpu += s.cpu
+				sum.hasCPU = true
+			}
+		}
+	}
+	return sum, found
+}
+
+func (l *listContainersModel) cpuOf(c Container) float64 {
+	s, _ := l.statsOf(c)
+	return s.cpu
+}
+
+func (l *listContainersModel) memOf(c Container) uint64 {
+	s, _ := l.statsOf(c)
+	return s.mem
+}
+
+// createdOf is a container's creation time, or a stack's newest service.
+func createdOf(c Container) time.Time {
+	t := c.Created
+	for _, child := range c.Children {
+		if child.Created.After(t) {
+			t = child.Created
+		}
+	}
+	return t
+}
+
+// runningIDs are the IDs of every running container, for stats.
+func runningIDs(all []Container) []string {
+	var ids []string
+	for _, c := range all {
+		for _, x := range append([]Container{c}, c.Children...) {
+			if x.Type == TypeContainer && x.State == containerTypes.StateRunning {
+				ids = append(ids, x.ID)
+			}
+		}
+	}
+	return ids
 }
 
 func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -229,24 +402,60 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return l, run
 		}
+		// While the filter is being typed, every key goes to it.
+		if l.filter.editing {
+			if l.filter.handle(msg) {
+				l.rebuild()
+			}
+			l.layout()
+			return l, nil
+		}
 
-		// Handle help
-		switch {
-		case key.Matches(msg, l.keys.Help):
+		if key.Matches(msg, l.keys.Help) {
 			l.help.ShowAll = !l.help.ShowAll
 			l.layout()
+			return l, nil
 		}
 
 		switch msg.String() {
 
 		case "esc":
+			// esc first clears an active filter, then goes back.
+			if l.filter.query() != "" {
+				l.filter.clear()
+				l.rebuild()
+				return l, nil
+			}
 			m := InitIndexModel(l.dockerClient, l.width, l.height).withSelected(cardContainers)
 			return m, m.Init()
+
+		case "/":
+			l.filter.open()
+			l.layout()
+			return l, nil
+
+		case "a":
+			l.runningOnly = !l.runningOnly
+			l.rebuild()
+			return l, nil
+
+		case "o":
+			l.sortBy = (l.sortBy + 1) % len(containerSorts)
+			l.rebuild()
+			return l, nil
 
 		case "d":
 			if c := l.selected(); c != nil {
 				l.confirm = deleteContainerPrompt(l.dockerClient, *c)
 			}
+			return l, nil
+
+		case "P":
+			prompt, refusal := pruneContainersPrompt(l.dockerClient, l.stopped)
+			if refusal != "" {
+				return l, l.status.set(l.tickID, statusSuccess, refusal)
+			}
+			l.confirm = prompt
 			return l, nil
 
 		case "enter":
@@ -269,23 +478,56 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					l.ShowChildrenSet.Add(c.Name)
 				}
-				l.refresh()
+				l.rebuild()
 			}
+			return l, nil
 
-		case "ctrl+c", "q":
+		case "i":
+			c := l.selected()
+			if c == nil || c.Type != TypeContainer {
+				return l, nil
+			}
+			im := InitInspectModel(l.dockerClient, c.ID, c.Name, l.width, l.height)
+			back := l
+			im.back = &back
+			return im, im.Init()
+
+		case "e":
+			c := l.selected()
+			if c == nil || c.Type != TypeContainer {
+				return l, nil
+			}
+			run, refusal := execShellCmd(*c)
+			if refusal != "" {
+				return l, l.status.set(l.tickID, statusError, refusal)
+			}
+			return l, run
+
+		case "q":
 			return l, tea.Quit
 
-		case "s":
+		case "s", "r", "p":
 			c := l.selected()
 			if c == nil {
 				return l, nil
 			}
-			plan, ok := planStartStop(*c)
+			var (
+				plan containerPlan
+				ok   bool
+			)
+			switch msg.String() {
+			case "s":
+				plan, ok = planStartStop(*c)
+			case "r":
+				plan, ok = planRestart(*c)
+			case "p":
+				plan, ok = planPause(*c)
+			}
 			if !ok {
 				return l, nil
 			}
 			l.status.set(l.tickID, statusProgress, plan.progress)
-			return l, startStopCmd(l.dockerClient, plan)
+			return l, containerPlanCmd(l.dockerClient, plan)
 		}
 
 	case containerActionMsg:
@@ -302,12 +544,31 @@ func (l listContainersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		l.status.clear(msg, l.tickID)
 		return l, nil
 
+	case statsMsg:
+		if msg.tickID != l.tickID {
+			return l, nil
+		}
+		l.statsInFlight = false
+		l.stats = mergeStats(l.samples, msg.samples)
+		l.samples = msg.samples
+		l.rebuild()
+		return l, nil
+
 	case tickMsg:
 		if msg.id != l.tickID {
 			return l, nil
 		}
 		l.refresh()
-		return l, tickCmd(l.tickID)
+		cmds := []tea.Cmd{tickCmd(l.tickID)}
+		if !l.statsInFlight && l.dockerClient != nil {
+			if ids := runningIDs(l.all); len(ids) > 0 {
+				l.statsInFlight = true
+				cmds = append(cmds, fetchStatsCmd(l.dockerClient, l.tickID, ids))
+			} else {
+				l.stats, l.samples = nil, nil
+			}
+		}
+		return l, tea.Batch(cmds...)
 	}
 
 	l.table, cmd = l.table.Update(msg)
@@ -329,11 +590,23 @@ func (l listContainersModel) View() string {
 		status = statusLine{text: l.listErr, kind: statusError}.render()
 	}
 
+	info := stateCounts(l.running, l.stopped)
+	var mode []string
+	if l.runningOnly {
+		mode = append(mode, "running only")
+	}
+	if l.sortBy > 0 {
+		mode = append(mode, "by "+containerSorts[l.sortBy].label)
+	}
+	if len(mode) > 0 {
+		info = mutedStyle.Render(strings.Join(mode, ", ")+"   ") + info
+	}
+
 	return renderListPage(
-		renderHeader(width, stateCounts(l.running, l.stopped), "Containers"),
+		renderHeader(width, info, withFilterCrumb(l.filter, "Containers")...),
 		tableBaseStyle.Render(l.table.View()),
 		panel,
-		renderBottomBar(width, l.help.View(l.keys), status),
+		renderBottomBar(width, l.bottomLeft(), status),
 	)
 }
 
@@ -531,147 +804,49 @@ func (l listContainersModel) getRows(containers []Container) ([]table.Row, []Con
 	rows := []table.Row{}
 	items := []Container{}
 
+	row := func(c Container, name string) table.Row {
+		s, ok := l.statsOf(c)
+		return table.Row{
+			stateGlyph(c.State),
+			name,
+			shortContainerID(c.ID),
+			c.Image,
+			formatPorts(c.Ports),
+			formatCPU(s, ok),
+			formatMem(s, ok),
+			c.Status,
+			c.State,
+		}
+	}
+
 	for _, container := range containers {
 		name := container.Name
+		open := container.Type == TypeComposeStack && l.expanded(container)
 		if container.Type == TypeComposeStack {
-			if l.ShowChildrenSet.Contains(container.Name) {
+			if open {
 				name = "▾ " + name
 			} else {
 				name = "▸ " + name
 			}
 		}
 
-		rows = append(rows, table.Row{
-			stateGlyph(container.State),
-			name,
-			shortContainerID(container.ID),
-			container.Image,
-			formatPorts(container.Ports),
-			container.Status,
-			container.State,
-		})
+		rows = append(rows, row(container, name))
 		items = append(items, container)
 
-		if container.Type == TypeComposeStack && l.ShowChildrenSet.Contains(container.Name) {
-			for i, child := range container.Children {
+		if open {
+			children := l.visibleChildren(container)
+			for i, child := range children {
 				branch := "├ "
-				if i == len(container.Children)-1 {
+				if i == len(children)-1 {
 					branch = "└ "
 				}
-				rows = append(rows, table.Row{
-					stateGlyph(child.State),
-					"  " + branch + child.Name,
-					shortContainerID(child.ID),
-					child.Image,
-					formatPorts(child.Ports),
-					child.Status,
-					child.State,
-				})
+				rows = append(rows, row(child, "  "+branch+child.Name))
 				items = append(items, child)
 			}
 		}
 	}
 
 	return rows, items
-}
-
-// startStopPlan is what "s" will do for the selected row.
-type startStopPlan struct {
-	start    bool        // start the targets (false: stop them)
-	targets  []Container // containers to act on
-	progress string      // status while it runs
-	done     string      // status when it succeeded
-}
-
-// canStart reports whether "s" starts a container in this state.
-func canStart(state string) bool {
-	return state == containerTypes.StateExited || state == containerTypes.StateCreated
-}
-
-// planStartStop decides what "s" does:
-//   - a container: stop it if running, start it if exited or created;
-//   - a compose stack: if any service is running, stop every running one;
-//     if none is, start them all. (Starting the rest of a partly running
-//     stack instead would make a stack with a one-shot service, which exits
-//     on its own, impossible to stop with "s".)
-//
-// ok is false when there is nothing to do (e.g. a paused container).
-func planStartStop(c Container) (plan startStopPlan, ok bool) {
-	if c.Type != TypeComposeStack {
-		switch {
-		case c.State == containerTypes.StateRunning:
-			return startStopPlan{false, []Container{c}, "Stopping " + c.Name + "…", "Stopped " + c.Name}, true
-		case canStart(c.State):
-			return startStopPlan{true, []Container{c}, "Starting " + c.Name + "…", "Started " + c.Name}, true
-		}
-		return startStopPlan{}, false
-	}
-
-	var running, startable []Container
-	for _, child := range c.Children {
-		switch {
-		case child.State == containerTypes.StateRunning:
-			running = append(running, child)
-		case canStart(child.State):
-			startable = append(startable, child)
-		}
-	}
-	count := func(n int) string {
-		if n == 1 {
-			return "1 container"
-		}
-		return fmt.Sprintf("%d containers", n)
-	}
-	if len(running) > 0 {
-		n := count(len(running))
-		return startStopPlan{false, running, "Stopping " + n + " in " + c.Name + "…", "Stopped " + n + " in " + c.Name}, true
-	}
-	if len(startable) > 0 {
-		n := count(len(startable))
-		return startStopPlan{true, startable, "Starting " + n + " in " + c.Name + "…", "Started " + n + " in " + c.Name}, true
-	}
-	return startStopPlan{}, false
-}
-
-// startStopCmd carries out a plan off the UI goroutine, acting on all
-// targets in parallel: a stop can take up to 10s per container while Docker
-// waits before killing it, which would freeze the screen or add up.
-func startStopCmd(dockerClient client.SDKClient, plan startStopPlan) tea.Cmd {
-	return func() tea.Msg {
-		var (
-			wg     sync.WaitGroup
-			mu     sync.Mutex
-			failed []string
-		)
-		for _, t := range plan.targets {
-			wg.Add(1)
-			go func(t Container) {
-				defer wg.Done()
-				var err error
-				if plan.start {
-					err = dockerClient.ContainerStart(context.Background(), t.ID, containerTypes.StartOptions{})
-				} else {
-					err = dockerClient.ContainerStop(context.Background(), t.ID, containerTypes.StopOptions{})
-				}
-				if err != nil {
-					mu.Lock()
-					failed = append(failed, fmt.Sprintf("%s: %v", t.Name, err))
-					mu.Unlock()
-				}
-			}(t)
-		}
-		wg.Wait()
-
-		if len(failed) > 0 {
-			verb := "stop"
-			if plan.start {
-				verb = "start"
-			}
-			sort.Strings(failed)
-			return containerActionMsg{err: fmt.Errorf("couldn't %s %s", verb, strings.Join(failed, "; "))}
-		}
-		return containerActionMsg{done: plan.done}
-	}
 }
 
 // deleteContainerPrompt builds the confirmation for deleting a container,

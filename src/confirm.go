@@ -16,7 +16,15 @@ type confirmPrompt struct {
 	title    string   // the question, e.g. "Delete stardocker-test?"
 	lines    []string // what will happen
 	progress string   // status shown while the action runs
+	yes      string   // what "y" does, shown next to it; "" means "delete"
 	run      tea.Cmd
+}
+
+// actionMsg reports the result of an async action on the volumes,
+// networks or images screens. done is the success message.
+type actionMsg struct {
+	err  error
+	done string
 }
 
 var confirmKeyStyle = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
@@ -32,7 +40,11 @@ func renderConfirmPanel(width int, p *confirmPrompt) string {
 	for _, line := range p.lines {
 		body = append(body, textStyle.Render(line))
 	}
-	keys := confirmKeyStyle.Render("y") + mutedStyle.Render(" delete   ") +
+	yes := p.yes
+	if yes == "" {
+		yes = "delete"
+	}
+	keys := confirmKeyStyle.Render("y") + mutedStyle.Render(" "+yes+"   ") +
 		crumbStyle.Render("n") + mutedStyle.Render(" cancel")
 
 	// Keep the keys on the last line of the panel whatever the text length.

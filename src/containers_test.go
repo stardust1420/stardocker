@@ -125,10 +125,10 @@ func TestPlanStartStop(t *testing.T) {
 		return out
 	}
 
-	if p, ok := planStartStop(web); !ok || p.start || p.done != "Stopped web" {
+	if p, ok := planStartStop(web); !ok || p.verb != "stop" || p.done != "Stopped web" {
 		t.Errorf("running container: %+v %v", p, ok)
 	}
-	if p, ok := planStartStop(fresh); !ok || !p.start || p.done != "Started fresh" {
+	if p, ok := planStartStop(fresh); !ok || p.verb != "start" || p.done != "Started fresh" {
 		t.Errorf("created container: %+v %v", p, ok)
 	}
 	if _, ok := planStartStop(paused); ok {
@@ -137,14 +137,14 @@ func TestPlanStartStop(t *testing.T) {
 
 	// Partly running stack: stop only the running services.
 	p, ok := planStartStop(composeStackSummary("demo", []Container{db, web, worker}))
-	if !ok || p.start || strings.Join(names(p.targets), ",") != "db,web" || p.progress != "Stopping 2 containers in demo…" {
+	if !ok || p.verb != "stop" || strings.Join(names(p.targets), ",") != "db,web" || p.progress != "Stopping 2 containers in demo…" {
 		t.Errorf("partial stack: %+v %v", p, ok)
 	}
 
 	// Fully stopped stack: start everything that can start.
 	stopped := composeStackSummary("demo", []Container{worker, fresh, paused})
 	p, ok = planStartStop(stopped)
-	if !ok || !p.start || strings.Join(names(p.targets), ",") != "worker,fresh" || p.done != "Started 2 containers in demo" {
+	if !ok || p.verb != "start" || strings.Join(names(p.targets), ",") != "worker,fresh" || p.done != "Started 2 containers in demo" {
 		t.Errorf("stopped stack: %+v %v", p, ok)
 	}
 }

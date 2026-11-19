@@ -59,69 +59,83 @@ var keys = keyMap{
 // they don't handle.
 type containersKeyMap struct {
 	keyMap
-	Open   key.Binding
-	Toggle key.Binding
-	Delete key.Binding
-	Quit   key.Binding
+	Open, Toggle, Restart, Pause, Exec, Inspect key.Binding
+	Delete, Prune, Filter, Sort, All, Quit      key.Binding
 }
 
+var (
+	quitKey   = key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit"))
+	filterKey = key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter"))
+	deleteKey = key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "delete"))
+	pruneKey  = key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "prune"))
+)
+
 var containersKeys = containersKeyMap{
-	keyMap: keys,
-	Open: key.NewBinding(
-		key.WithKeys("enter"),
-		key.WithHelp("enter", "logs / expand stack"),
-	),
-	Toggle: key.NewBinding(
-		key.WithKeys("s"),
-		key.WithHelp("s", "start/stop"),
-	),
-	Delete: key.NewBinding(
-		key.WithKeys("d"),
-		key.WithHelp("d", "delete"),
-	),
-	Quit: key.NewBinding(
-		key.WithKeys("q", "ctrl+c"),
-		key.WithHelp("q", "quit"),
-	),
+	keyMap:  keys,
+	Open:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "logs / expand stack")),
+	Toggle:  key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "start/stop")),
+	Restart: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "restart")),
+	Pause:   key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause/unpause")),
+	Exec:    key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "shell")),
+	Inspect: key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "inspect")),
+	Delete:  deleteKey,
+	Prune:   key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "prune stopped")),
+	Filter:  filterKey,
+	Sort:    key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "sort")),
+	All:     key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "running only")),
+	Quit:    quitKey,
 }
 
 func (k containersKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Open, k.Toggle, k.Delete, k.Left, k.Help}
+	return []key.Binding{k.Open, k.Toggle, k.Exec, k.Filter, k.Left, k.Help}
 }
 
 func (k containersKeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Open, k.Left},
-		{k.Toggle, k.Delete, k.Quit, k.Help},
+		{k.Toggle, k.Restart, k.Pause, k.Delete},
+		{k.Exec, k.Inspect, k.Prune},
+		{k.Filter, k.Sort, k.All},
+		{k.Quit, k.Help},
 	}
 }
 
-// imagesKeyMap adds delete to the shared bindings for the images screen.
-type imagesKeyMap struct {
+// listKeyMap is the help of the images, volumes and networks screens: the
+// shared bindings plus that screen's actions.
+type listKeyMap struct {
 	keyMap
-	Delete key.Binding
-	Quit   key.Binding
+	actions []key.Binding
 }
 
-var imagesKeys = imagesKeyMap{
-	keyMap: keys,
-	Delete: key.NewBinding(
-		key.WithKeys("d"),
-		key.WithHelp("d", "delete"),
-	),
-	Quit: containersKeys.Quit,
+func (k listKeyMap) ShortHelp() []key.Binding {
+	short := append([]key.Binding{}, k.actions...)
+	return append(short, filterKey, k.Left, k.Help)
 }
 
-func (k imagesKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Delete, k.Left, k.Help}
-}
-
-func (k imagesKeyMap) FullHelp() [][]key.Binding {
+func (k listKeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Left},
-		{k.Delete, k.Quit, k.Help},
+		k.actions,
+		{filterKey, quitKey, k.Help},
 	}
 }
+
+var (
+	imagesKeys = listKeyMap{keyMap: keys, actions: []key.Binding{
+		deleteKey,
+		key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pull")),
+		key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "prune dangling")),
+		key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "sort")),
+	}}
+	volumesKeys = listKeyMap{keyMap: keys, actions: []key.Binding{
+		deleteKey,
+		key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "prune unused")),
+	}}
+	networksKeys = listKeyMap{keyMap: keys, actions: []key.Binding{
+		deleteKey,
+		key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "prune unused")),
+	}}
+)
 
 // ShortHelp returns keybindings to be shown in the mini help view. It's part
 // of the key.Map interface.

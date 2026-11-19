@@ -1,0 +1,50 @@
+# Builds release binaries when a v* tag is pushed (see .github/workflows/release.yml).
+# Try it locally with: goreleaser release --snapshot --clean
+version: 2
+
+project_name: stardocker
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: .
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^Merge pull request"
+
+# Homebrew: create a public repo named homebrew-tap, add a fine-grained token
+# with write access to it as the HOMEBREW_TAP_TOKEN secret, then uncomment.
+# Users can then run: brew install stardust1420/tap/stardocker
+# homebrew_casks:
+#   - repository:
+#       owner: stardust1420
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+#     homepage: https://github.com/stardust1420/stardocker
+#     description: A terminal UI for your local Docker containers
+#     license: MIT

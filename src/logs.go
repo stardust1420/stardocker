@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -40,7 +41,13 @@ type logsModel struct {
 	status statusLine
 	// back is the containers screen this view was opened from; esc returns
 	// to it so its cursor and expanded stacks are kept.
-	back     *listContainersModel
+	back *listContainersModel
+	// stream follows new output while the container runs; nil otherwise.
+	stream *logStream
+	// filter shows only matching lines; nowrap turns line wrapping off
+	// (←/→ then scroll sideways).
+	filter   filterBar
+	nowrap   bool
 	logs     string
 	ready    bool
 	viewport viewport.Model
@@ -60,9 +67,13 @@ func InitLogsModel(dockerClient client.SDKClient, containerID string, containerN
 		tickID:        newTickID(),
 		hours:         defaultLogHours,
 		rangeInput:    newRangeInput(),
+		filter:        newFilterBar(),
 	}
-	l.inspect()
-	l.logs = GetContainerLogs(dockerClient, containerID, l.tty, l.since())
+	if dockerClient != nil {
+		l.inspect()
+		l.logs = GetContainerLogs(dockerClient, containerID, l.tty, l.since())
+		l.follow()
+	}
 	if width > 0 && height > 0 {
 		l.setSize(width, height)
 	}
@@ -74,47 +85,6 @@ const defaultLogHours = 1
 
 // maxLogHours caps the range a user can type (one year).
 const maxLogHours = 24 * 365
-
-// numberField is a minimal one-line input for a number: digits and one
-// decimal point, backspace to delete, ctrl+u to empty it.
-type numberField struct {
-	value string
-	limit int
-}
-
-func newRangeInput() numberField { return numberField{limit: 7} }
-
-// update applies a key and reports whether the field used it.
-func (f *numberField) update(msg tea.KeyMsg) bool {
-	switch msg.Type {
-	case tea.KeyBackspace:
-		if f.value != "" {
-			r := []rune(f.value)
-			f.value = string(r[:len(r)-1])
-		}
-		return true
-	case tea.KeyCtrlU:
-		f.value = ""
-		return true
-	case tea.KeyRunes:
-		for _, r := range msg.Runes {
-			switch {
-			case len(f.value) >= f.limit:
-			case r >= '0' && r <= '9':
-				f.value += string(r)
-			case r == '.' && !strings.Contains(f.value, "."):
-				f.value += "."
-			}
-		}
-		return true
-	}
-	return false
-}
-
-// view draws the value with a block cursor after it.
-func (f numberField) view() string {
-	return crumbStyle.Render(f.value) + lipgloss.NewStyle().Background(colorAccent).Render(" ")
-}
 
 // parseHours reads the range field: a positive number of hours, decimals
 // allowed, at most maxLogHours.
@@ -146,7 +116,40 @@ func formatHours(h float64) string {
 }
 
 func (l logsModel) Init() tea.Cmd {
-	return tea.Batch(tea.SetWindowTitle("Logs: "+l.containerName), tickCmd(l.tickID))
+	return tea.Batch(tea.SetWindowTitle("Logs: "+l.containerName), tickCmd(l.tickID), waitLogs(l.stream))
+}
+
+// follow starts streaming new output, from just after the last line shown
+// (or the chosen range if there is none), if the container is running and
+// no stream is open. A stopped container's stream would only replay its
+// logs and end.
+func (l *logsModel) follow() {
+	if l.stream != nil || l.gone || l.state == nil || !l.state.Running {
+		return
+	}
+	since := l.since()
+	if last, ok := lastLogTimestamp(l.logs); ok {
+		since = last.Add(time.Nanosecond).Format(time.RFC3339Nano)
+	}
+	l.stream = startLogStream(l.dockerClient, l.containerID, l.tty, since)
+}
+
+// stopFollowing closes the stream, if any.
+func (l *logsModel) stopFollowing() {
+	l.stream.stop()
+	l.stream = nil
+}
+
+// setContent redraws the viewport, staying at the bottom if it was there.
+func (l *logsModel) setContent() {
+	if !l.ready {
+		return
+	}
+	atBottom := l.viewport.AtBottom()
+	l.viewport.SetContent(l.wrapped())
+	if atBottom {
+		l.viewport.GotoBottom()
+	}
 }
 
 // setSize builds the viewport on first call and resizes it afterwards,
@@ -187,9 +190,46 @@ func (l logsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if l.editingRange {
 			return l.updateRangeInput(msg)
 		}
+		if l.filter.editing {
+			if l.filter.handle(msg) {
+				l.viewport.SetContent(l.wrapped())
+				l.viewport.GotoBottom()
+			}
+			return l, nil
+		}
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return l, tea.Quit
+		case "/":
+			l.filter.open()
+			return l, nil
+		case "w":
+			l.nowrap = !l.nowrap
+			if l.nowrap {
+				l.viewport.SetHorizontalStep(8)
+			} else {
+				l.viewport.SetHorizontalStep(0)
+				l.viewport.SetXOffset(0)
+			}
+			l.setContent()
+			return l, nil
+		case "o":
+			path, n, err := saveLogs(l.containerName, l.visibleLogs())
+			if err != nil {
+				l.status.set(l.tickID, statusError, "Couldn't save the logs: "+err.Error())
+				return l, nil
+			}
+			return l, l.status.set(l.tickID, statusSuccess, fmt.Sprintf("Saved %d lines to %s", n, path))
+		case "e":
+			if l.gone || l.state == nil {
+				return l, nil
+			}
+			run, refusal := execShellCmd(Container{ID: l.containerID, Name: l.containerName, Type: TypeContainer, State: l.state.Status})
+			if refusal != "" {
+				l.status.set(l.tickID, statusError, refusal)
+				return l, nil
+			}
+			return l, run
 		case "s":
 			// Start or stop this container, as on the containers screen.
 			if l.gone || l.state == nil {
@@ -200,13 +240,20 @@ func (l logsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return l, nil
 			}
 			l.status.set(l.tickID, statusProgress, plan.progress)
-			return l, startStopCmd(l.dockerClient, plan)
+			return l, containerPlanCmd(l.dockerClient, plan)
 		case "t":
 			l.editingRange = true
 			l.rangeErr = ""
 			l.rangeInput.value = strconv.FormatFloat(l.hours, 'f', -1, 64)
 			return l, nil
 		case "esc":
+			if l.filter.query() != "" {
+				l.filter.clear()
+				l.viewport.SetContent(l.wrapped())
+				l.viewport.GotoBottom()
+				return l, nil
+			}
+			l.stopFollowing()
 			if l.back != nil {
 				m := l.back.resume(l.width, l.height)
 				return m, m.Init()
@@ -234,8 +281,7 @@ func (l logsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return l, nil
 			}
 			l.clearedAfter = time.Time{}
-			l.reload()
-			return l, nil
+			return l, l.reload()
 		}
 
 	case tea.WindowSizeMsg:
@@ -243,13 +289,36 @@ func (l logsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return l, nil
 
 	case containerActionMsg:
-		// Show the new state right away instead of on the next tick.
+		// Show the new state right away instead of on the next tick, and
+		// follow again if the container was just started.
 		l.inspect()
+		var wait tea.Cmd
+		if l.stream == nil {
+			l.follow()
+			wait = waitLogs(l.stream)
+		}
 		if msg.err != nil {
 			l.status.set(l.tickID, statusError, msg.err.Error())
+			return l, wait
+		}
+		if msg.done == "" {
+			return l, wait
+		}
+		return l, tea.Batch(wait, l.status.set(l.tickID, statusSuccess, msg.done))
+
+	case logLinesMsg:
+		if l.stream == nil || msg.streamID != l.stream.id {
 			return l, nil
 		}
-		return l, l.status.set(l.tickID, statusSuccess, msg.done)
+		if len(msg.lines) > 0 {
+			l.logs = appendCapped(l.logs, strings.Join(msg.lines, ""))
+			l.setContent()
+		}
+		if msg.ended {
+			l.stream = nil // the next tick follows again if it runs
+			return l, nil
+		}
+		return l, waitLogs(l.stream)
 
 	case clearStatusMsg:
 		l.status.clear(msg, l.tickID)
@@ -259,22 +328,16 @@ func (l logsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.id != l.tickID {
 			return l, nil
 		}
+		// The tick only refreshes the state in the header and restarts the
+		// stream if the container runs again; new lines come from the stream.
+		// Once the container is gone, its last logs stay on screen.
 		l.inspect()
-		// Once the container is gone, keep the last logs on screen instead of
-		// replacing them with a "no such container" error.
-		if !l.gone {
-			l.logs = GetContainerLogs(l.dockerClient, l.containerID, l.tty, l.since())
+		cmds := []tea.Cmd{tickCmd(l.tickID)}
+		if l.stream == nil {
+			l.follow()
+			cmds = append(cmds, waitLogs(l.stream))
 		}
-		if l.ready {
-			// Decide whether to follow before the new content shifts the
-			// scroll position.
-			atBottom := l.viewport.AtBottom()
-			l.viewport.SetContent(l.wrapped())
-			if atBottom {
-				l.viewport.GotoBottom()
-			}
-		}
-		return l, tickCmd(l.tickID)
+		return l, tea.Batch(cmds...)
 	}
 
 	// Handle keyboard and mouse events in the viewport
@@ -304,8 +367,7 @@ func (l logsModel) updateRangeInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		l.rangeErr = ""
 		// A new range replaces any clear.
 		l.clearedAfter = time.Time{}
-		l.reload()
-		return l, nil
+		return l, l.reload()
 	}
 	if l.rangeInput.update(msg) {
 		l.rangeErr = ""
@@ -313,23 +375,95 @@ func (l logsModel) updateRangeInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return l, nil
 }
 
-// reload fetches the logs again for the current range and jumps to the end.
-func (l *logsModel) reload() {
+// reload fetches the logs again for the current range, jumps to the end
+// and follows from there with a new stream.
+func (l *logsModel) reload() tea.Cmd {
+	l.stopFollowing()
 	l.logs = GetContainerLogs(l.dockerClient, l.containerID, l.tty, l.since())
 	l.viewport.SetContent(l.wrapped())
 	l.viewport.GotoBottom()
+	l.follow()
+	return waitLogs(l.stream)
+}
+
+// visibleLogs is the log text with the filter applied.
+func (l logsModel) visibleLogs() string {
+	q := l.filter.query()
+	if q == "" {
+		return l.logs
+	}
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(l.logs, "\n") {
+		if line != "" && strings.Contains(strings.ToLower(line), q) {
+			b.WriteString(line)
+		}
+	}
+	return b.String()
 }
 
 // wrapped is the log text wrapped to the viewport's text width (inside the
 // left padding that lines it up with the header).
 func (l logsModel) wrapped() string {
+	if q := l.filter.query(); q != "" {
+		shown := l.visibleLogs()
+		if shown == "" {
+			return mutedStyle.Render("No lines match “" + l.filter.crumb()[1:] + "”. Press esc to clear the filter.")
+		}
+		shown = highlight(shown, q)
+		if l.nowrap {
+			return shown
+		}
+		return wordwrap.String(shown, max(1, l.viewport.Width-textIndent))
+	}
 	if l.logs == "" && !l.clearedAfter.IsZero() {
 		return mutedStyle.Render("Cleared. New output will appear here. Press a to show the last " + formatHours(l.hours) + " again.")
 	}
 	if l.logs == "" {
 		return mutedStyle.Render("No output in the last " + formatHours(l.hours) + ". Press t to look further back.")
 	}
+	if l.nowrap {
+		return l.logs
+	}
 	return wordwrap.String(l.logs, max(1, l.viewport.Width-textIndent))
+}
+
+var matchStyle = lipgloss.NewStyle().Background(colorAccent).Foreground(colorInk)
+
+// highlight marks every case-insensitive occurrence of q (already
+// lower-case) in s.
+func highlight(s, q string) string {
+	lower := strings.ToLower(s)
+	if q == "" || len(lower) != len(s) {
+		return s // lower-casing changed byte offsets; don't risk cutting runes
+	}
+	var b strings.Builder
+	i := 0
+	for {
+		j := strings.Index(lower[i:], q)
+		if j < 0 {
+			b.WriteString(s[i:])
+			return b.String()
+		}
+		b.WriteString(s[i : i+j])
+		b.WriteString(matchStyle.Render(s[i+j : i+j+len(q)]))
+		i += j + len(q)
+	}
+}
+
+// saveLogs writes the logs to <name>-<time>.log in the current directory
+// and returns its path and line count.
+func saveLogs(name, logs string) (string, int, error) {
+	safe := strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' || r == ':' || r == ' ' {
+			return '-'
+		}
+		return r
+	}, name)
+	path := fmt.Sprintf("%s-%s.log", safe, time.Now().Format("20060102-150405"))
+	if err := os.WriteFile(path, []byte(logs), 0o644); err != nil {
+		return "", 0, err
+	}
+	return path, strings.Count(logs, "\n"), nil
 }
 
 // since is the LogsOptions.Since value: the chosen number of hours back, or
@@ -371,7 +505,7 @@ func (l logsModel) View() string {
 // right, over a rule.
 func (l logsModel) headerView() string {
 	state := describeContainerState(l.state, l.gone, time.Now())
-	header := renderHeader(l.viewport.Width, state, "Containers", l.containerName)
+	header := renderHeader(l.viewport.Width, state, withFilterCrumb(l.filter, "Containers", l.containerName)...)
 	return header + "\n" + borderStyle.Render(strings.Repeat("─", max(0, l.viewport.Width)))
 }
 
@@ -392,13 +526,27 @@ func (l logsModel) footerView() string {
 		return rule + "\n" + line
 	}
 
+	if l.filter.editing {
+		return rule + "\n" + indent + l.filter.prompt()
+	}
+
 	clearHint := hint("c", "clear")
 	if !l.clearedAfter.IsZero() {
 		clearHint = hint("a", "show all")
 	}
-	keys := indent + strings.Join([]string{
-		hint("↑/↓", "scroll"), hint("G", "end"), hint("s", "start/stop"), clearHint, hint("t", "time range"), hint("esc", "back"), hint("q", "quit"),
-	}, "   ")
+	wrapHint := hint("w", "no wrap")
+	if l.nowrap {
+		wrapHint = hint("w", "wrap") + "  " + hint("←/→", "scroll")
+	}
+	// Most useful first; hints are dropped from the end when they don't fit.
+	all := []string{
+		hint("esc", "back"), hint("/", "filter"), hint("s", "start/stop"), hint("e", "shell"), clearHint,
+		hint("t", "time range"), wrapHint, hint("o", "save"), hint("G", "end"), hint("q", "quit"),
+	}
+	keys := indent + strings.Join(all, "   ")
+	for n := len(all) - 1; n > 2 && l.viewport.Width > 0 && lipgloss.Width(keys)+12 > l.viewport.Width; n-- {
+		keys = indent + strings.Join(all[:n], "   ")
+	}
 
 	window := "last " + formatHours(l.hours)
 	if !l.clearedAfter.IsZero() {
