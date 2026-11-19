@@ -13,11 +13,12 @@ go build .        # produces ./stardocker (binary is gitignored)
 go run .          # run directly; needs a reachable Docker daemon
 go vet ./...
 gofmt -l .
-docker run -d --name stardocker-test alpine:3.20 sh -c 'i=0; while true; do i=$((i+1)); echo "tick $i"; sleep 2; done'   # test container that keeps logging; remove with docker rm -f stardocker-test
+docker run -d --name stardocker-test alpine:3.20 sh -c 'i=0; while true; do i=$((i+1)); echo "tick $i"; sleep 2; done'   # test container that keeps logging; remove with docker rm -f stardocker-test. `sh` ignores SIGTERM, so stopping it takes ~10s and it exits with 137
 ```
 
 Unit tests live in `src/*_test.go` (`go test ./src/...`; one test: `go test ./src/... -run TestName`). They cover only pure helpers; anything that calls Docker needs the daemon.
 The TUI needs a real TTY, so Claude can't drive it. Check changes with build + vet, then have the user run `! go run .`.
+To see a screen without a TTY, add a temporary `src/zz_*_tmp_test.go` that builds the model with a real `client.New`, sends it `tea.KeyMsg`s, runs any returned `tea.Cmd` and feeds the result back, then prints `View()` with ANSI codes stripped (`sed 's/\x1b\[[0-9;]*m//g'`). Delete it afterwards.
 
 ## Architecture
 
@@ -36,6 +37,7 @@ The TUI needs a real TTY, so Claude can't drive it. Check changes with build + v
 - **Window size:** Bubble Tea sends `tea.WindowSizeMsg` only at startup and on resize, so every `Init*Model` constructor takes `width, height` from the screen it came from. Pass them along when you add a screen.
 - **Rows vs. data:** table cells are display-only. `getRows` returns the rows plus a parallel `items` slice (the `Container` for each row), and actions use `selected()` (`items[cursor]`). The images screen does the same with `[]Image`. Keep the two slices in step if you change how rows are built.
 - **Column widths:** column sets are `[]colSpec` (`containerColumns`, `imageColumns`). `fitColumns` (`src/columns.go`) sizes each column to its content and terminal width, shrinking by `shrinkOrder` (Ports shrinks last). It runs on every refresh and on resize. Spare width goes to columns with `grow`. Cells that still don't fit are truncated with `…`, so the details panel (`detailsBody` in `src/details.go`) under each table shows the selected row in full.
+- Bubbles' table and viewport keymaps already bind `d`/`u` (half page), `f`/`b`/`space` (page) and `j`/`k`. A screen that adds one of these keys must handle it and `return` before passing the message to `table.Update` or `viewport.Update`.
 - Models use value receivers, so mutations inside `Init()` are discarded. The containers table fills on an immediate first tick fired from `Init()`.
 - Docker errors in the containers and logs screens are shown in the UI (a status line or the log text). Start/stop run as async `tea.Cmd`s that return `containerActionMsg`.
 
