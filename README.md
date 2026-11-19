@@ -23,9 +23,10 @@
 
 - 📦 **List all containers** — view both running and stopped containers at a glance
 - ▶️ **Start & Stop** — toggle container state directly from the TUI
+- 🗑️ **Delete** — remove containers, whole Compose stacks, images or image tags, always behind a confirmation
 - 📜 **Live Logs** — stream container logs in real-time with a scrollable viewport
 - 🗂️ **Compose-aware** — automatically groups Docker Compose stacks with expandable children
-- 🖼️ **Browse Images** — view available Docker images and their download status
+- 🖼️ **Browse Images** — see local images with their size, age and which containers use them
 - 🚀 **Auto-starts Docker** — detects if the Docker daemon is down and runs `colima start` for you
 - ⌨️ **Keyboard-driven** — fast, intuitive navigation with vim-style keybindings
 
@@ -33,7 +34,7 @@
 
 ## 📸 How It Works
 
-StarDocker connects directly to your local Docker daemon via the Docker SDK. It renders an interactive table of your containers with live state indicators (`⏺`) so you can see what's running at a glance — then lets you drill into logs or control containers without ever leaving the terminal.
+StarDocker connects directly to your local Docker daemon via the Docker SDK. It renders an interactive table of your containers with live state indicators (`●` running, `◐` partly running, `○` stopped) so you can see what's running at a glance — then lets you drill into logs or control containers without ever leaving the terminal.
 
 ---
 
@@ -75,10 +76,12 @@ Just type `stardocker` in your terminal. That's it — no config files, no flags
 
 ### Main Menu
 
+The home screen sits in a slowly drifting, twinkling starfield. Set `STARDOCKER_REDUCED_MOTION=1` to keep the stars but stop the motion.
+
 | Option       | Description                              |
 |:-------------|:-----------------------------------------|
 | Containers   | View and manage all Docker containers    |
-| Images       | Browse available Docker images           |
+| Images       | Browse and delete local Docker images    |
 | Exit         | Quit StarDocker                          |
 
 ### Keybindings
@@ -89,20 +92,36 @@ Just type `stardocker` in your terminal. That's it — no config files, no flags
 | `↓` / `j`   | Move down                                |
 | `Enter`      | Select / Expand compose stack / View logs |
 | `Esc`        | Go back                                  |
-| `r`          | Start or stop the selected container      |
+| `s`          | Start or stop the selected container or compose stack (also in the logs view) |
+| `d`          | Delete the selected container, stack or image (asks first) |
+| `y` / `n`    | Confirm or cancel a delete                |
+| `t`          | Logs view: choose how many hours back to show |
+| `c` / `a`    | Logs view: clear the view / show the time range again |
 | `q`          | Quit                                     |
 | `?`          | Toggle help                              |
 
 ### Containers View
 
-- Running containers are marked with a `⏺` indicator
+- Containers are marked `●` running or `○` stopped; a Compose stack with only some services up is marked `◐`
 - **Docker Compose stacks** are automatically detected and grouped — press `Enter` to expand/collapse child containers
-- Press `r` on a stopped container to **start** it, or on a running container to **stop** it
+- Press `s` on a stopped container to **start** it, or on a running container to **stop** it
+- Press `s` on a compose stack row to stop every running service in it, or, if none is running, to start them all
+- Press `d` to **delete** a container. A running one is stopped first. On a stack row, `d` deletes every container in the stack. Volumes and networks are always kept
 - Press `Enter` on a container to view its **live logs**
+- The panel under the table shows everything about the selected row: full ports, image, command and status
+
+### Images View
+
+- One row per tag, with size, age and the containers that use each image
+- Press `d` to **delete** an image. If the image has other tags, only the selected tag is removed
+- An image that containers still use can't be deleted; delete those containers first
 
 ### Logs View
 
-- Logs are fetched from the last 24 hours with timestamps
+- Logs from the last hour are shown, with timestamps. Press `t` and type a number of hours (decimals work, so `0.5` is 30 minutes) to look further back or narrow it down
+- The header shows whether the container is running (and for how long) or how and when it exited
+- Press `s` to start or stop the container without leaving its logs
+- Press `c` to clear the view and see only new output from then on, and `a` to bring back the chosen time range. This hides lines in StarDocker only; Docker keeps the container's logs
 - The viewport auto-scrolls to the bottom for new output
 - Scroll freely with arrow keys or vim bindings; auto-scroll resumes when you're near the bottom
 
@@ -114,11 +133,15 @@ Just type `stardocker` in your terminal. That's it — no config files, no flags
 stardocker/
 ├── main.go            # Entry point — Docker client init & TUI bootstrap
 └── src/
-    ├── index.go       # Main menu model
-    ├── containers.go  # Container listing, start/stop, Compose grouping
+    ├── index.go       # Home screen with menu cards
+    ├── containers.go  # Container listing, start/stop/delete, Compose grouping
     ├── logs.go        # Live container log viewer
-    ├── images.go      # Image browser
-    ├── styles.go      # Lipgloss styles and theming
+    ├── images.go      # Image listing and delete
+    ├── confirm.go     # Delete confirmation prompt and status messages
+    ├── layout.go      # Palette and shared screen layout
+    ├── columns.go     # Fits table columns to the terminal width
+    ├── details.go     # Details panel for the selected row
+    ├── styles.go      # Table styles
     └── help.go        # Keybinding definitions & help overlay
 ```
 

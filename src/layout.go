@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // Shared layout for the list screens (containers, images):
@@ -40,13 +41,13 @@ var (
 	colorText    = lipgloss.Color("252")
 	colorInk     = lipgloss.Color("#020202")
 
-	pageStyle    = lipgloss.NewStyle().MarginLeft(pageMargin)
-	brandStyle   = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	crumbStyle   = lipgloss.NewStyle().Foreground(colorText).Bold(true)
-	mutedStyle   = lipgloss.NewStyle().Foreground(colorMuted)
-	runningStyle = lipgloss.NewStyle().Foreground(colorRunning)
-	borderStyle  = lipgloss.NewStyle().Foreground(colorBorder)
-	statusStyle  = lipgloss.NewStyle().Foreground(colorAccent)
+	pageStyle         = lipgloss.NewStyle().MarginLeft(pageMargin)
+	brandStyle        = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	crumbStyle        = lipgloss.NewStyle().Foreground(colorText).Bold(true)
+	mutedStyle        = lipgloss.NewStyle().Foreground(colorMuted)
+	runningStyle      = lipgloss.NewStyle().Foreground(colorRunning)
+	borderStyle       = lipgloss.NewStyle().Foreground(colorBorder)
+	statusAccentStyle = lipgloss.NewStyle().Foreground(colorAccent)
 )
 
 // Row state glyphs: shape carries the meaning, colour only reinforces it.
@@ -102,10 +103,17 @@ func stateCounts(running, stopped int) string {
 // its top border, and a fixed number of content lines so the layout doesn't
 // jump as the selection moves.
 func renderPanel(width int, title, body string, lines int) string {
+	return renderPanelColored(width, title, body, lines, colorBorder, crumbStyle)
+}
+
+// renderPanelColored is renderPanel with a custom border colour and title
+// style (the delete confirmation uses red).
+func renderPanelColored(width int, title, body string, lines int, border lipgloss.Color, titleStyle lipgloss.Style) string {
+	edge := lipgloss.NewStyle().Foreground(border)
 	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderTop(false).
-		BorderForeground(colorBorder).
+		BorderForeground(border).
 		Padding(0, 1).
 		Height(lines).
 		MaxHeight(lines + 1) // + bottom border
@@ -120,18 +128,23 @@ func renderPanel(width int, title, body string, lines int) string {
 		label = " " + truncate(title, max(0, boxWidth-6)) + " "
 	}
 	fill := max(0, boxWidth-3-lipgloss.Width(label))
-	top := borderStyle.Render("╭─") + crumbStyle.Render(label) + borderStyle.Render(strings.Repeat("─", fill)+"╮")
+	top := edge.Render("╭─") + titleStyle.Render(label) + edge.Render(strings.Repeat("─", fill)+"╮")
 	return top + "\n" + box
 }
 
-// renderBottomBar puts the help keys on the left and a status message (if
-// any) right-aligned on the same line.
-func renderBottomBar(width int, helpView, status string) string {
+// renderBottomBar puts the help keys on the left and an already styled
+// status message (if any) right-aligned on the same line.
+func renderBottomBar(width int, helpView, st string) string {
 	help := lipgloss.NewStyle().PaddingLeft(textIndent).Render(helpView)
-	if status == "" {
+	if st == "" {
 		return help
 	}
-	st := statusStyle.Render(status)
+	// Never run past the window: shorten the status to the room left.
+	if width > 0 {
+		if room := width - lipgloss.Width(help) - 2 - textIndent; lipgloss.Width(st) > room {
+			st = ansiTruncate(st, max(1, room))
+		}
+	}
 	gap := 3
 	if width > 0 {
 		gap = max(2, width-lipgloss.Width(help)-lipgloss.Width(st)-textIndent)
@@ -148,6 +161,11 @@ func renderListPage(header, table, panel, bottom string) string {
 		pageStyle.Render(panel),
 		pageStyle.Render(bottom),
 	)
+}
+
+// ansiTruncate shortens a styled string to w cells, keeping its styling.
+func ansiTruncate(s string, w int) string {
+	return ansi.Truncate(s, w, "…")
 }
 
 func truncate(s string, w int) string {
