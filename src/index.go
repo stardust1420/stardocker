@@ -13,6 +13,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	containerTypes "github.com/docker/docker/api/types/container"
 	imageTypes "github.com/docker/docker/api/types/image"
+	networkTypes "github.com/docker/docker/api/types/network"
+	volumeTypes "github.com/docker/docker/api/types/volume"
 	"github.com/docker/go-sdk/client"
 )
 
@@ -25,14 +27,18 @@ type menuCard struct {
 }
 
 var menuCards = []menuCard{
-	{key: "1", title: "Containers", description: "Start, stop, read logs"},
-	{key: "2", title: "Images", description: "See what's on disk"},
-	{key: "3", title: "Exit", description: "Close StarDocker"},
+	{key: "1", title: "Containers", description: "Run, stop, read logs"},
+	{key: "2", title: "Images", description: "Pull, prune, sizes"},
+	{key: "3", title: "Volumes", description: "Data that persists"},
+	{key: "4", title: "Networks", description: "How containers talk"},
+	{key: "5", title: "Exit", description: "Close StarDocker"},
 }
 
 const (
 	cardContainers = iota
 	cardImages
+	cardVolumes
+	cardNetworks
 	cardExit
 )
 
@@ -41,6 +47,8 @@ type dockerSummary struct {
 	running, containers int
 	images              int
 	imagesSize          int64
+	volumes             int
+	networks            int
 	err                 error
 }
 
@@ -57,7 +65,7 @@ var indexKeys = indexKeyMap{
 	Left:   key.NewBinding(key.WithKeys("left", "h", "shift+tab", "up", "k"), key.WithHelp("←/h", "previous")),
 	Right:  key.NewBinding(key.WithKeys("right", "l", "tab", "down", "j"), key.WithHelp("→/l", "next")),
 	Select: key.NewBinding(key.WithKeys("enter", " "), key.WithHelp("enter", "open")),
-	Jump:   key.NewBinding(key.WithKeys("1", "2", "3"), key.WithHelp("1-3", "open card")),
+	Jump:   key.NewBinding(key.WithKeys("1", "2", "3", "4", "5"), key.WithHelp("1-5", "open card")),
 	Quit:   key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	Help:   key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "toggle help")),
 }
@@ -151,6 +159,15 @@ func fetchSummaryCmd(dockerClient client.SDKClient, tickID int) tea.Cmd {
 			s.imagesSize += img.Size
 		}
 
+		// Volumes and networks are secondary; a failure there leaves the
+		// count at zero rather than marking Docker unreachable.
+		if vols, err := dockerClient.VolumeList(ctx, volumeTypes.ListOptions{}); err == nil {
+			s.volumes = len(vols.Volumes)
+		}
+		if nets, err := dockerClient.NetworkList(ctx, networkTypes.ListOptions{}); err == nil {
+			s.networks = len(nets)
+		}
+
 		return summaryMsg{tickID: tickID, summary: s}
 	}
 }
@@ -163,6 +180,12 @@ func (m indexModel) open(card int) (tea.Model, tea.Cmd) {
 	case cardImages:
 		im := InitListImagesModel(m.dockerClient, m.width, m.height)
 		return im, im.Init()
+	case cardVolumes:
+		v := InitListVolumesModel(m.dockerClient, m.width, m.height)
+		return v, v.Init()
+	case cardNetworks:
+		n := InitListNetworksModel(m.dockerClient, m.width, m.height)
+		return n, n.Init()
 	case cardExit:
 		return m, tea.Quit
 	}
@@ -228,7 +251,7 @@ func (m indexModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // Home screen layout: the orange banner is exactly as wide as the row of
 // cards, and the whole block is centred in the window.
 const (
-	cardWidth  = 26 // lipgloss Width: includes padding, excludes border
+	cardWidth  = 24 // lipgloss Width: includes padding, excludes border
 	cardHeight = 6  // same height for every card even if a line wraps
 	cardGap    = 3
 	cardText   = cardWidth - 4 // minus horizontal padding
@@ -288,6 +311,10 @@ func (m indexModel) cardStat(card int) string {
 		}
 		return crumbStyle.Render(humanSize(m.summary.imagesSize)) +
 			mutedStyle.Render(fmt.Sprintf(" in %d %s", m.summary.images, noun))
+	case cardVolumes:
+		return crumbStyle.Render(fmt.Sprintf("%d", m.summary.volumes)) + mutedStyle.Render(plural(m.summary.volumes, " volume", " volumes"))
+	case cardNetworks:
+		return crumbStyle.Render(fmt.Sprintf("%d", m.summary.networks)) + mutedStyle.Render(plural(m.summary.networks, " network", " networks"))
 	}
 	return ""
 }
@@ -327,7 +354,7 @@ func (m indexModel) daemonLine() string {
 		}
 	}
 	if m.summary != nil && m.summary.err != nil {
-		return dangerTextStyle.Render("Can't reach Docker at " + host + ". Is Colima running?")
+		return dangerTextStyle.Render("Can't reach Docker at " + host + ". Is Docker running?")
 	}
 	if host == "" {
 		return ""
@@ -341,16 +368,23 @@ func (m indexModel) View() string {
 		cards[i] = m.renderCard(i)
 	}
 
-	row := lipgloss.JoinHorizontal(lipgloss.Top, intersperse(cards, strings.Repeat(" ", cardGap))...)
+	// The fewest rows that fit the window, with the cards spread evenly
+	// over them (3 + 2 rather than 4 + 1).
+	var row string
+	for rows := 1; rows <= len(cards); rows++ {
+		perRow := (len(cards) + rows - 1) / rows
+		row = cardGrid(cards, perRow)
+		if m.width <= 0 || lipgloss.Width(row)+2 <= m.width {
+			break
+		}
+	}
 	rowWidth := lipgloss.Width(row)
-	banner := bannerStyle.Width(rowWidth).Render(strings.Join(bannerArt, "\n"))
 
-	// Too narrow for the big banner and three cards side by side: stack the
-	// cards and use a compact banner of the same width.
-	if m.width > 0 && rowWidth+2 > m.width {
-		row = lipgloss.JoinVertical(lipgloss.Left, cards...)
-		rowWidth = lipgloss.Width(row)
-		banner = bannerStyle.Width(rowWidth).Bold(true).Render("★ StarDocker")
+	// The big banner when the grid is at least as wide as the art; a compact
+	// one of the same width otherwise.
+	banner := bannerStyle.Width(rowWidth).Bold(true).Render("★ StarDocker")
+	if rowWidth >= lipgloss.Width(bannerArt[0])+2 {
+		banner = bannerStyle.Width(rowWidth).Render(strings.Join(bannerArt, "\n"))
 	}
 
 	// JoinVertical with Center centres every block on the widest one.
@@ -372,6 +406,24 @@ func (m indexModel) View() string {
 		}
 	}
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, page)
+}
+
+// cardGrid lays the cards out perRow to a row, rows separated by a blank
+// line.
+func cardGrid(cards []string, perRow int) string {
+	var rows []string
+	for i := 0; i < len(cards); i += perRow {
+		end := min(i+perRow, len(cards))
+		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, intersperse(cards[i:end], strings.Repeat(" ", cardGap))...))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, intersperse(rows, "")...)
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func intersperse(items []string, sep string) []string {
